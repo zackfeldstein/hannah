@@ -1,0 +1,21 @@
+# Hannah's own output and memory (regenerated at runtime)
+logs/
+
+# Local model weights - large GGUF files, not committed
+models/
+*.gguf
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.python-version
+
+# Editor / OS cruft
+.vscode/
+.idea/
+*.swp
+.DS_Store
