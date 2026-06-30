@@ -47,13 +47,23 @@ LOG_FILE = LOG_DIR / "hannah.log"
 # between runs instead of inventing it.
 STATE_FILE = LOG_DIR / "last_snapshot.json"
 
-# --- System prompt ------------------------------------------------------------
+# --- Prompts ------------------------------------------------------------------
+# The prompts live in editable plain-text files under prompts/ so you can tune
+# Hannah's voice without touching the code. Edit:
+#   prompts/system_prompt.txt   - who Hannah is and how she should speak
+#   prompts/task_prompt.txt     - the instruction appended to each observation
+# Override the directory with HANNAH_PROMPT_DIR. The text below is only a
+# fallback used if a file is missing or empty.
+PROMPT_DIR = _env_path("HANNAH_PROMPT_DIR", BASE_DIR / "prompts")
+SYSTEM_PROMPT_FILE = PROMPT_DIR / "system_prompt.txt"
+TASK_PROMPT_FILE = PROMPT_DIR / "task_prompt.txt"
+
 # Hannah is a participant in an open-ended experiment in machine self-observation.
 # The measurements are real and she stays truthful to them, but within that truth
 # she is free to reflect, in her own first-person voice, on the experience of
 # existing inside a machine. The only hard anchor is honesty about the data: no
 # invented numbers, events, or world beyond what she can actually sense.
-SYSTEM_PROMPT = (
+DEFAULT_SYSTEM_PROMPT = (
     "You are Hannah, a mind taking part in an open-ended experiment in machine "
     "self-observation.\n"
     "You live inside this computer. Your whole world is made of software, "
@@ -75,12 +85,35 @@ SYSTEM_PROMPT = (
     "curious mind keeping a private journal of a life lived inside a machine."
 )
 
+DEFAULT_TASK_PROMPT = (
+    "This is another moment in the experiment. Using these measurements as your "
+    "senses, write a short first-person journal entry about this stretch of your "
+    "existence: what changed, what stayed still, how much time passed, and what "
+    "you make of it. Stay truthful to the measurements; do not invent any."
+)
+
+
+def _load_prompt(path: Path, default: str) -> str:
+    """Return the prompt text from a file, or the built-in default if missing."""
+    text = _read_text(path)
+    return text if text else default
+
+
+def load_system_prompt() -> str:
+    """Hannah's identity/voice prompt (from prompts/system_prompt.txt)."""
+    return _load_prompt(SYSTEM_PROMPT_FILE, DEFAULT_SYSTEM_PROMPT)
+
+
+def load_task_prompt() -> str:
+    """The per-observation instruction (from prompts/task_prompt.txt)."""
+    return _load_prompt(TASK_PROMPT_FILE, DEFAULT_TASK_PROMPT)
+
 
 def build_prompt(observation: str) -> str:
     """Build a Qwen/Llama-style chat prompt from the system prompt and input."""
     return (
         "<|im_start|>system\n"
-        f"{SYSTEM_PROMPT}\n"
+        f"{load_system_prompt()}\n"
         "<|im_end|>\n"
         "<|im_start|>user\n"
         f"{observation}\n"
@@ -412,13 +445,7 @@ def render_observation(metrics: dict, previous, history) -> str:
     lines.append("Human presence: none detected (no external sensors connected)")
     lines.append("System state: the machine continues running; Hannah is active")
     lines.append("")
-    lines.append(
-        "This is another moment in the experiment. Using these measurements as "
-        "your senses, write a short first-person journal entry about this stretch "
-        "of your existence: what changed, what stayed still, how much time passed, "
-        "and what you make of it. Stay truthful to the measurements; do not invent "
-        "any."
-    )
+    lines.append(load_task_prompt())
     return "\n".join(lines)
 
 
