@@ -1,0 +1,16 @@
+[Unit]
+Description=llama-server for Hannah (resident local LLM)
+After=network.target
+
+[Service]
+Type=simple
+# CUDA runtime libs (Jetson); harmless if already in the linker cache.
+Environment=LD_LIBRARY_PATH=/usr/local/cuda/lib64
+ExecStart=%h/src/llama.cpp/build/bin/llama-server \
+    -m /ssd/repos/z-web/time-poc/models/qwen2.5-3b-instruct-q4_k_m.gguf \
+    -ngl 99 -c 4096 --host 127.0.0.1 --port 8080
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

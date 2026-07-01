@@ -1,0 +1,16 @@
+[Unit]
+Description=Hannah - continuous machine self-observation daemon
+After=hannah-llama.service network.target
+Requires=hannah-llama.service
+
+[Service]
+Type=simple
+WorkingDirectory=/ssd/repos/z-web/time-poc
+ExecStart=/usr/bin/python3 /ssd/repos/z-web/time-poc/hannah.py --daemon
+Restart=always
+RestartSec=5
+# Allow time for the farewell entry (a final model call) on stop.
+TimeoutStopSec=45
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,13 @@
+[Unit]
+Description=Hannah web viewer (read-only journal + live state)
+After=hannah.service network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/ssd/repos/z-web/time-poc
+ExecStart=/usr/bin/python3 /ssd/repos/z-web/time-poc/hannah_web.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

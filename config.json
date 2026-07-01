@@ -1,0 +1,41 @@
+{
+  "server": {
+    "url": "http://127.0.0.1:8080",
+    "timeout_s": 120,
+    "startup_wait_s": 180
+  },
+  "generation": {
+    "tokens": 320,
+    "temperature": 0.7,
+    "top_p": 0.9,
+    "repeat_penalty": 1.12
+  },
+  "daemon": {
+    "sense_tick_s": 20,
+    "heartbeat_s": 900,
+    "min_gap_s": 90
+  },
+  "memory": {
+    "recent_entries": 6,
+    "themes_every": 20
+  },
+  "salience": {
+    "temp_c": 3.0,
+    "power_w": 0.5,
+    "load_frac_of_cores": 0.7,
+    "mem_mib": 200,
+    "nproc": 15,
+    "disk_gb": 1.0,
+    "sessions_any": true
+  },
+  "log": {
+    "max_mb": 5,
+    "keep": 3
+  },
+  "web": {
+    "host": "0.0.0.0",
+    "port": 8600,
+    "cache_s": 5,
+    "max_entries": 100
+  }
+}

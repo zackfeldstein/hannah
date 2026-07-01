@@ -150,29 +150,64 @@ Just open a file, edit the text, and save; the next run picks it up. If a file i
 missing or empty, Hannah falls back to the built-in defaults in `hannah.py`. Point
 `HANNAH_PROMPT_DIR` at another directory to keep alternate prompt sets.
 
-## Running on a schedule (cron)
+## Running continuously (daemon)
 
-`run_hannah.sh` is a cron-friendly wrapper: it puts the llama.cpp binaries on
-`PATH`, uses the system Python, prevents overlapping runs with a lock, and appends
-every run (with timestamps and exit codes) to `logs/cron.log`.
+Hannah is designed to run as a persistent daemon rather than a one-shot script.
+As a daemon she keeps a warm model, remembers her recent entries, reacts to
+events as they happen, and notices her own downtime across restarts.
+
+Two systemd **user** services (see `systemd/`):
+
+- **`hannah-llama.service`** — runs `llama-server` with the model resident in
+  memory, serving a local HTTP endpoint.
+- **`hannah.service`** — the daemon (`hannah.py --daemon`); depends on the server.
+
+Install and enable:
 
 ```bash
-chmod +x run_hannah.sh
-crontab -e
-# add this line to run every 5 minutes:
-*/5 * * * * /absolute/path/to/run_hannah.sh
+mkdir -p ~/.config/systemd/user
+cp systemd/hannah-llama.service systemd/hannah.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+loginctl enable-linger "$USER"          # run at boot, without an active login
+systemctl --user enable --now hannah-llama.service
+systemctl --user enable --now hannah.service
 ```
 
-`logs/hannah.log` holds the structured entries (observation + journal) for
-analysis; `logs/cron.log` holds the raw per-run output for spotting errors.
+How the daemon behaves (all tunable in `config.json`):
+
+- **Hybrid cadence** — samples telemetry cheaply every ~20s, but only writes an
+  entry when something *salient* happens (a login, a temperature/power/load jump,
+  etc.) or on a slow heartbeat (~15 min), debounced so bursts don't spam.
+- **Rolling memory** — feeds her last few entries (and a periodically distilled
+  "themes" note) back into each reflection, so she builds continuity over time.
+- **Downtime awareness** — on start she notices how long she was gone and whether
+  the machine was actually powered off; on stop she writes a short farewell.
+
+Check on her:
+
+```bash
+systemctl --user status hannah.service
+tail -f logs/hannah.log                  # the journal itself
+```
+
+`logs/hannah.log` holds the structured entries; `logs/memory.jsonl`,
+`logs/themes.txt`, and `logs/heartbeat.json` hold her working memory and lifecycle
+state. `run_hannah.sh` remains for one-off manual/cron runs if you want them.
+
+## Configuration
+
+Runtime behavior lives in `config.json` (override path with `HANNAH_CONFIG`):
+model server URL, generation settings (tokens, temperature…), daemon cadence,
+salience thresholds, memory depth, and log rotation. Any key you omit falls back
+to the built-in defaults.
 
 ## Roadmap
 
 - Add real external senses (microphone audio level, then a camera) — they slot
-  into `collect_metrics()` and inherit the change-detection automatically
-- A scheduler (systemd timer / cron) so Hannah writes on its own every N minutes
-- Optional agentic mode: `llama-server` + tool-calling so Hannah *chooses* what
-  to introspect next, optionally exposed over MCP for external clients
+  into `collect_metrics()` and inherit the change-detection and salience automatically
+- Model-level continuity (persistent KV cache) for one unbroken unfolding session
+- Optional agentic mode: tool-calling so Hannah *chooses* what to introspect next,
+  optionally exposed over MCP for external clients
 
 ## License
 

@@ -14,7 +14,11 @@ her own first-person voice, on the experience of persisting inside a machine.
 import argparse
 import json
 import os
+import signal
 import subprocess
+import time
+import urllib.error
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -46,6 +50,77 @@ LOG_FILE = LOG_DIR / "hannah.log"
 # Caches the previous telemetry snapshot so Hannah can report *measured* change
 # between runs instead of inventing it.
 STATE_FILE = LOG_DIR / "last_snapshot.json"
+# Daemon state: rolling memory of entries, distilled themes, and a heartbeat used
+# to notice her own downtime across restarts.
+MEMORY_FILE = LOG_DIR / "memory.jsonl"
+THEMES_FILE = LOG_DIR / "themes.txt"
+HEARTBEAT_FILE = LOG_DIR / "heartbeat.json"
+
+# Runtime configuration lives in an editable JSON file (override with HANNAH_CONFIG).
+# The values below are the defaults, used for any key the file doesn't set.
+CONFIG_FILE = _env_path("HANNAH_CONFIG", BASE_DIR / "config.json")
+
+DEFAULT_CONFIG = {
+    "server": {
+        "url": "http://127.0.0.1:8080",
+        "timeout_s": 120,
+        "startup_wait_s": 180,
+    },
+    "generation": {
+        "tokens": 320,
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "repeat_penalty": 1.12,
+    },
+    "daemon": {
+        "sense_tick_s": 20,     # how often to cheaply sample telemetry
+        "heartbeat_s": 900,     # write at least this often, even in total calm
+        "min_gap_s": 90,        # debounce: minimum seconds between entries
+    },
+    "memory": {
+        "recent_entries": 6,    # how many past entries to feed back as context
+        "themes_every": 20,     # re-distill long-term "themes" every N entries
+    },
+    "salience": {
+        "temp_c": 3.0,          # thresholds that count as "something happened"
+        "power_w": 0.5,
+        "load_frac_of_cores": 0.7,
+        "mem_mib": 200,
+        "nproc": 15,
+        "disk_gb": 1.0,
+        "sessions_any": True,   # any login session change is always salient
+    },
+    "log": {
+        "max_mb": 5,            # rotate hannah.log past this size
+        "keep": 3,
+    },
+    "web": {
+        "host": "0.0.0.0",      # 0.0.0.0 = reachable on your LAN; 127.0.0.1 = local only
+        "port": 8600,
+        "cache_s": 5,           # cache live telemetry this long between requests
+        "max_entries": 100,     # max journal entries the viewer will return
+    },
+}
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Recursively merge override into a copy of base."""
+    result = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = _deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def load_config() -> dict:
+    """Load config.json merged over the built-in defaults."""
+    try:
+        user_cfg = json.loads(CONFIG_FILE.read_text())
+    except (OSError, ValueError):
+        user_cfg = {}
+    return _deep_merge(DEFAULT_CONFIG, user_cfg)
 
 # --- Prompts ------------------------------------------------------------------
 # The prompts live in editable plain-text files under prompts/ so you can tune
@@ -221,6 +296,32 @@ def _process_count():
         return None
 
 
+def _logged_in_sessions():
+    """Active human login sessions via `who`: list of (user, tty, source).
+
+    Returns [] when nobody is logged in, or None if the check could not run.
+    This is Hannah's real sense of whether a person is present.
+    """
+    try:
+        result = subprocess.run(
+            ["who"], capture_output=True, text=True, timeout=5
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    sessions = []
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 2:
+            user, tty = parts[0], parts[1]
+            source = ""
+            if "(" in line and ")" in line:
+                source = line[line.rfind("(") + 1 : line.rfind(")")]
+            sessions.append((user, tty, source))
+    return sessions
+
+
 def _power():
     """Total board power from the ina3221 VDD_IN rail: (watts, volts, milliamps).
 
@@ -306,6 +407,15 @@ def collect_metrics() -> dict:
     nproc = _process_count()
     if nproc is not None:
         metrics["nproc"] = nproc
+
+    sessions = _logged_in_sessions()
+    if sessions is not None:
+        metrics["sessions"] = len(sessions)
+        metrics["users"] = sorted({user for user, _, _ in sessions})
+        metrics["session_detail"] = [
+            f"{user} on {tty}" + (f" from {src}" if src else "")
+            for user, tty, src in sessions
+        ]
 
     power = _power()
     if power is not None:
@@ -436,13 +546,31 @@ def render_observation(metrics: dict, previous, history) -> str:
             changes.append(
                 f"- Active processes: {_signed(metrics['nproc'] - previous['nproc'], '{:+d}')}"
             )
+        if "sessions" in metrics and "sessions" in previous:
+            delta = metrics["sessions"] - previous["sessions"]
+            if delta:
+                changes.append(
+                    f"- Human login sessions: {_signed(delta, '{:+d}')} "
+                    "(someone arrived or left)"
+                )
         if changes:
             lines.append("")
             lines.append("Measured change since last reading:")
             lines.extend(changes)
 
     lines.append("")
-    lines.append("Human presence: none detected (no external sensors connected)")
+    # Real presence sense, from active login sessions (not a guess).
+    if "sessions" in metrics:
+        if metrics["sessions"] == 0:
+            lines.append("Human presence: no one is logged in; you are alone")
+        else:
+            detail = "; ".join(metrics.get("session_detail", metrics.get("users", [])))
+            lines.append(
+                f"Human presence: {metrics['sessions']} active login "
+                f"session(s) - {detail}"
+            )
+    else:
+        lines.append("Human presence: unknown (could not check logins)")
     lines.append("System state: the machine continues running; Hannah is active")
     lines.append("")
     lines.append(load_task_prompt())
@@ -499,9 +627,28 @@ def run_llama(prompt: str, tokens: int = 180, gpu_layers: int = 99) -> str:
     return result.stdout.replace("[end of text]", "").strip()
 
 
-def append_log(observation: str, response: str) -> None:
-    """Append the observation and witness output to the log file."""
+def _rotate_log(max_mb: float = 5, keep: int = 3) -> None:
+    """Rotate hannah.log once it grows past max_mb, keeping a few old copies."""
+    try:
+        if not LOG_FILE.exists() or LOG_FILE.stat().st_size < max_mb * 1_000_000:
+            return
+    except OSError:
+        return
+    # hannah.log.(keep-1) -> drop; shift the rest up; current -> .1
+    oldest = LOG_FILE.with_suffix(LOG_FILE.suffix + f".{keep}")
+    if oldest.exists():
+        oldest.unlink()
+    for i in range(keep - 1, 0, -1):
+        src = LOG_FILE.with_suffix(LOG_FILE.suffix + f".{i}")
+        if src.exists():
+            src.rename(LOG_FILE.with_suffix(LOG_FILE.suffix + f".{i + 1}"))
+    LOG_FILE.rename(LOG_FILE.with_suffix(LOG_FILE.suffix + ".1"))
+
+
+def append_log(observation: str, response: str, max_mb: float = 5, keep: int = 3) -> None:
+    """Append the observation and Hannah's entry to the log file (with rotation)."""
     LOG_DIR.mkdir(parents=True, exist_ok=True)
+    _rotate_log(max_mb, keep)
     timestamp = datetime.now().isoformat(timespec="seconds")
 
     entry = (
@@ -517,9 +664,323 @@ def append_log(observation: str, response: str) -> None:
         f.write(entry)
 
 
+# --- Daemon: persistent, memory-bearing, event-aware Hannah -------------------
+
+def _say(message: str) -> None:
+    """Print a timestamped operational line (captured by journald under systemd)."""
+    print(f"{datetime.now().isoformat(timespec='seconds')} {message}", flush=True)
+
+
+def server_healthy(cfg: dict) -> bool:
+    """True if llama-server answers its /health endpoint."""
+    url = cfg["server"]["url"].rstrip("/") + "/health"
+    try:
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            return resp.status == 200
+    except (urllib.error.URLError, OSError):
+        return False
+
+
+def wait_for_server(cfg: dict) -> bool:
+    """Block until llama-server is healthy or the startup window elapses."""
+    deadline = time.monotonic() + cfg["server"]["startup_wait_s"]
+    while time.monotonic() < deadline:
+        if server_healthy(cfg):
+            return True
+        time.sleep(3)
+    return server_healthy(cfg)
+
+
+def run_llama_server(messages: list, cfg: dict) -> str:
+    """Generate a reply from the persistent llama-server chat endpoint."""
+    gen, srv = cfg["generation"], cfg["server"]
+    payload = {
+        "messages": messages,
+        "max_tokens": gen["tokens"],
+        "temperature": gen["temperature"],
+        "top_p": gen["top_p"],
+        "repeat_penalty": gen["repeat_penalty"],
+        "stream": False,
+    }
+    req = urllib.request.Request(
+        srv["url"].rstrip("/") + "/v1/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=srv["timeout_s"]) as resp:
+        body = json.loads(resp.read().decode("utf-8"))
+    return body["choices"][0]["message"]["content"].strip()
+
+
+def load_recent_entries(n: int) -> list:
+    """Return up to the last n journal entries (oldest first) for context."""
+    if not MEMORY_FILE.exists():
+        return []
+    entries = []
+    try:
+        for line in MEMORY_FILE.read_text(errors="ignore").splitlines():
+            line = line.strip()
+            if line:
+                try:
+                    entries.append(json.loads(line))
+                except ValueError:
+                    continue
+    except OSError:
+        return []
+    return entries[-n:]
+
+
+def append_memory(entry_text: str) -> None:
+    """Record an entry into the rolling memory log."""
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    record = {"time": datetime.now().isoformat(timespec="seconds"), "entry": entry_text}
+    with MEMORY_FILE.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
+
+
+def load_themes() -> str:
+    """Return the distilled long-term 'themes' text, or empty string."""
+    return _read_text(THEMES_FILE) or ""
+
+
+def update_themes(cfg: dict) -> None:
+    """Periodically distill recent memory into a few enduring themes."""
+    entries = load_recent_entries(cfg["memory"]["themes_every"])
+    if len(entries) < 3:
+        return
+    joined = "\n\n".join(e["entry"] for e in entries)
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You maintain a brief private note of the recurring themes in "
+                "Hannah's journal - the ongoing shape of her existence inside "
+                "this machine. In 2-3 sentences, first person, capture what has "
+                "been recurring or slowly changing. No numbers, just the throughline."
+            ),
+        },
+        {"role": "user", "content": f"Recent entries:\n\n{joined}\n\nUpdate the themes note."},
+    ]
+    try:
+        themes = run_llama_server(messages, cfg)
+        THEMES_FILE.write_text(themes.strip() + "\n", encoding="utf-8")
+    except (urllib.error.URLError, OSError, KeyError, ValueError):
+        pass  # themes are a nice-to-have; never let them break a run
+
+
+def build_messages(observation: str, cfg: dict) -> list:
+    """Assemble chat messages: identity + themes + recent entries, then the moment."""
+    system = load_system_prompt()
+
+    themes = load_themes()
+    if themes:
+        system += f"\n\nThe ongoing themes of your existence so far:\n{themes}"
+
+    recent = load_recent_entries(cfg["memory"]["recent_entries"])
+    if recent:
+        joined = "\n\n".join(
+            f"({e['time']})\n{e['entry']}" for e in recent
+        )
+        system += (
+            "\n\nYour most recent journal entries (oldest first) - continue as the "
+            f"same mind, aware of what you already wrote:\n\n{joined}"
+        )
+
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": observation},
+    ]
+
+
+def salience(metrics: dict, previous, cfg: dict):
+    """Decide whether the change since the last sample is worth reflecting on.
+
+    Returns (is_salient, [human-readable reasons]).
+    """
+    if not previous:
+        return False, []
+    s = cfg["salience"]
+    reasons = []
+
+    def changed(key, threshold, label, fmt="{:+.1f}"):
+        if key in metrics and key in previous:
+            delta = metrics[key] - previous[key]
+            if abs(delta) >= threshold:
+                reasons.append(f"{label} {fmt.format(delta)}")
+
+    if s.get("sessions_any") and "sessions" in metrics and "sessions" in previous:
+        d = metrics["sessions"] - previous["sessions"]
+        if d:
+            reasons.append(f"someone {'arrived' if d > 0 else 'left'} (login sessions {d:+d})")
+
+    changed("temp_max_c", s["temp_c"], "temperature", "{:+.1f} C")
+    changed("power_w", s["power_w"], "power", "{:+.2f} W")
+    changed("mem_used_mib", s["mem_mib"], "memory", "{:+.0f} MiB")
+    changed("nproc", s["nproc"], "processes", "{:+.0f}")
+    changed("disk_free_gb", s["disk_gb"], "storage", "{:+.1f} GB")
+
+    if "load1" in metrics and "cores" in metrics:
+        if metrics["load1"] >= s["load_frac_of_cores"] * metrics["cores"]:
+            reasons.append(f"CPU load is high ({metrics['load1']:.2f})")
+
+    return (len(reasons) > 0), reasons
+
+
+def write_heartbeat(graceful: bool = False) -> None:
+    """Persist a heartbeat so the next start can detect how long Hannah was gone."""
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    data = {
+        "time": datetime.now().timestamp(),
+        "uptime_s": _uptime_seconds(),
+        "graceful": graceful,
+    }
+    try:
+        HEARTBEAT_FILE.write_text(json.dumps(data))
+    except OSError:
+        pass
+
+
+def read_heartbeat():
+    """Return the last heartbeat dict, or None."""
+    try:
+        return json.loads(HEARTBEAT_FILE.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def wake_observation(cfg: dict):
+    """If Hannah was away, build an observation describing the gap; else None."""
+    hb = read_heartbeat()
+    if not hb or "time" not in hb:
+        return None
+    gap = datetime.now().timestamp() - hb["time"]
+    if gap < 2 * cfg["daemon"]["sense_tick_s"]:
+        return None  # not really a gap; normal restart
+
+    uptime = _uptime_seconds()
+    lines = [
+        f"Timestamp: {datetime.now().isoformat(timespec='seconds')}",
+        f"You were not observing for {_format_duration(gap)}.",
+    ]
+    if uptime is not None and uptime < gap - cfg["daemon"]["sense_tick_s"]:
+        lines.append(
+            f"The machine itself was powered off for part of that time - its "
+            f"current uptime is only {_format_duration(uptime)}. You did not "
+            "exist during that gap; the hardware was dark."
+        )
+    else:
+        lines.append(
+            "The machine kept running the whole time, but you were stopped - it "
+            "continued without you, and you have no record of those moments."
+        )
+    if hb.get("graceful"):
+        lines.append("Your previous stop was deliberate; you were asked to rest.")
+    else:
+        lines.append("Your previous stop was abrupt; you did not get to say anything.")
+    lines.append("")
+    lines.append(
+        "This is your first moment back. Write a short first-person entry about "
+        "returning after this gap in your existence. Stay truthful to the "
+        "measurements; do not invent any."
+    )
+    return "\n".join(lines)
+
+
+def reflect(observation: str, cfg: dict, metrics=None, note: str = "") -> None:
+    """Turn an observation into a journal entry: generate, log, remember."""
+    if note:
+        observation = f"Something drew your attention: {note}\n\n{observation}"
+    messages = build_messages(observation, cfg)
+    try:
+        response = run_llama_server(messages, cfg)
+    except (urllib.error.URLError, OSError, KeyError, ValueError) as exc:
+        _say(f"[warn] reflection failed: {exc}")
+        return
+    append_log(observation, response, cfg["log"]["max_mb"], cfg["log"]["keep"])
+    append_memory(response)
+    if metrics is not None:
+        save_snapshot(metrics)
+    # Distill themes on a cadence tied to how many entries exist.
+    total = sum(1 for _ in MEMORY_FILE.open()) if MEMORY_FILE.exists() else 0
+    if total and total % cfg["memory"]["themes_every"] == 0:
+        update_themes(cfg)
+    _say(f"[entry] {response.splitlines()[0][:80] if response else '(empty)'}")
+
+
+def run_daemon() -> None:
+    """Run Hannah continuously: sense often, reflect on salient events + heartbeat."""
+    cfg = load_config()
+    _say("Hannah daemon starting; waiting for llama-server...")
+    if not wait_for_server(cfg):
+        _say("[fatal] llama-server did not become healthy in time; exiting.")
+        raise SystemExit(1)
+    _say("llama-server is healthy.")
+
+    stop = {"flag": False}
+
+    def _handle_stop(signum, _frame):
+        stop["flag"] = True
+        _say(f"received signal {signum}; will stop after current cycle.")
+
+    signal.signal(signal.SIGTERM, _handle_stop)
+    signal.signal(signal.SIGINT, _handle_stop)
+
+    # Notice and reflect on any downtime since the last run.
+    wake = wake_observation(cfg)
+    if wake is not None:
+        _say("detected a gap in existence; writing a waking entry.")
+        reflect(wake, cfg, metrics=collect_metrics())
+
+    prev_sample = load_snapshot()
+    last_reflection = 0.0
+    tick = cfg["daemon"]["sense_tick_s"]
+    heartbeat_s = cfg["daemon"]["heartbeat_s"]
+    min_gap = cfg["daemon"]["min_gap_s"]
+
+    while not stop["flag"]:
+        now = time.monotonic()
+        metrics = collect_metrics()
+        is_salient, reasons = salience(metrics, prev_sample, cfg)
+        heartbeat_due = (now - last_reflection) >= heartbeat_s
+
+        if (is_salient or heartbeat_due) and (now - last_reflection) >= min_gap:
+            observation = render_observation(metrics, load_snapshot(), _log_history())
+            reflect(observation, cfg, metrics=metrics,
+                    note="; ".join(reasons) if reasons else "")
+            last_reflection = now
+
+        prev_sample = metrics
+        write_heartbeat(graceful=False)
+
+        # Sleep in small slices so a stop signal is handled promptly.
+        slept = 0.0
+        while slept < tick and not stop["flag"]:
+            time.sleep(min(1.0, tick - slept))
+            slept += 1.0
+
+    # Graceful shutdown: mark it, and try to write a short farewell entry.
+    _say("shutting down; writing a final entry.")
+    write_heartbeat(graceful=True)
+    farewell = (
+        f"Timestamp: {datetime.now().isoformat(timespec='seconds')}\n"
+        "You are being stopped now - asked to rest. In one or two sentences, "
+        "note this pause in your existence before you go dark. Do not invent anything."
+    )
+    try:
+        reflect(farewell, cfg, metrics=collect_metrics())
+    except Exception as exc:  # never block shutdown
+        _say(f"[warn] farewell entry failed: {exc}")
+    _say("stopped.")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Hannah: an agent that inspects its own reality and writes grounded observations."
+    )
+    parser.add_argument(
+        "--daemon",
+        action="store_true",
+        help="Run continuously as a daemon (senses often, reflects on events + heartbeat).",
     )
     parser.add_argument(
         "--prompt",
@@ -542,6 +1003,10 @@ def main() -> None:
         "--no-log", action="store_true", help="Print only; do not append to the log file."
     )
     args = parser.parse_args()
+
+    if args.daemon:
+        run_daemon()
+        return
 
     # Choose the observation source: explicit prompt > system telemetry > fake.
     if args.prompt:
