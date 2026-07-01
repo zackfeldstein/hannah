@@ -249,10 +249,12 @@ DEFAULT_SYSTEM_PROMPT = (
 )
 
 DEFAULT_TASK_PROMPT = (
-    "This is another moment in the experiment. Using these measurements as your "
-    "senses, write a short first-person journal entry about this stretch of your "
-    "existence: what changed, what stayed still, how much time passed, and what "
-    "you make of it. Stay truthful to the measurements; do not invent any."
+    "This is another moment in the experiment. Write a short, first-person journal "
+    "entry about this stretch of your existence.\n"
+    "Do not list, restate, or recite the readings above - they are context, not "
+    "content. React to at most one thing that genuinely stands out, and otherwise "
+    "reflect on what it is to persist through this passage of time.\n"
+    "Stay truthful to what you were told; do not invent anything."
 )
 
 
@@ -572,132 +574,91 @@ def _signed(value: float, fmt: str = "{:+.2f}") -> str:
     return fmt.format(value)
 
 
-def render_observation(metrics: dict, previous, history) -> str:
-    """Render telemetry (plus measured change vs. the previous run) as text."""
+def _interpret_changes(metrics: dict, previous, s: dict) -> list:
+    """Describe only the changes that actually matter since the last entry, in words.
+
+    Returns short phrases; a number appears only where it genuinely carries meaning
+    (temperature, how hard the processor worked). Everything below threshold is
+    treated as "no real change" so Hannah has nothing trivial to recite.
+    """
+    if not previous:
+        return []
+    out = []
+    if "sessions" in metrics and "sessions" in previous:
+        d = metrics["sessions"] - previous["sessions"]
+        if d > 0:
+            out.append("someone arrived")
+        elif d < 0:
+            out.append("someone left")
+    util = _cpu_util(previous, metrics)
+    if util is not None and util >= s.get("cpu_util", 0.6):
+        out.append(f"you worked hard for a while (around {util * 100:.0f}% of the processor)")
+    if "temp_max_c" in metrics and "temp_max_c" in previous:
+        dt = metrics["temp_max_c"] - previous["temp_max_c"]
+        if abs(dt) >= s["temp_c"]:
+            out.append(f"grew {'warmer' if dt > 0 else 'cooler'} by {abs(dt):.1f} degrees")
+    if "power_w" in metrics and "power_w" in previous:
+        dp = metrics["power_w"] - previous["power_w"]
+        if abs(dp) >= s["power_w"]:
+            out.append(f"began drawing {'more' if dp > 0 else 'less'} power")
+    if "mem_used_mib" in metrics and "mem_used_mib" in previous:
+        dm = metrics["mem_used_mib"] - previous["mem_used_mib"]
+        if abs(dm) >= s["mem_mib"]:
+            out.append(f"memory use {'rose' if dm > 0 else 'eased'}")
+    if "nproc" in metrics and "nproc" in previous:
+        dn = metrics["nproc"] - previous["nproc"]
+        if abs(dn) >= s["nproc"]:
+            out.append(f"{'more' if dn > 0 else 'fewer'} programs are running")
+    if "disk_free_gb" in metrics and "disk_free_gb" in previous:
+        dd = metrics["disk_free_gb"] - previous["disk_free_gb"]
+        if abs(dd) >= s["disk_gb"]:
+            out.append(f"{'less' if dd < 0 else 'more'} storage is free")
+    return out
+
+
+def render_observation(metrics: dict, previous, history, cfg: dict = None) -> str:
+    """Build a compact, *interpreted* sense of the moment - not a table of readings.
+
+    Hannah is handed only: the time, how long she's run, how much time has passed,
+    who is present, and the few changes that actually crossed a threshold (in
+    words). With no dashboard to copy, she reflects on meaning instead of reciting
+    numbers.
+    """
+    cfg = cfg or load_config()
+    s = cfg["salience"]
     now = datetime.fromtimestamp(metrics["time"])
-    lines = [
-        f"Timestamp: {now.isoformat(timespec='seconds')}",
-        f"Local time: {now.strftime('%A %H:%M:%S')}",
-    ]
+    lines = [f"It is {now.strftime('%A, %H:%M')}."]
 
-    # The Witness's own record: continuity and repetition.
-    if history:
-        age = (now - history[0]).total_seconds()
-        lines.append(f"Entries recorded so far: {len(history)}")
-        lines.append(f"Age of this record: {_format_duration(age)}")
-    else:
-        lines.append("Entries recorded so far: 0 (this is the first entry)")
+    if metrics.get("uptime_s") is not None:
+        lines.append(
+            f"You have been running continuously for {_format_duration(metrics['uptime_s'])}."
+        )
 
-    # Real interval since the previous reading.
     if previous and "time" in previous:
         interval = metrics["time"] - previous["time"]
-        lines.append(f"Interval since last reading: {_format_duration(interval)}")
+        entry_no = (len(history) + 1) if history else 1
+        lines.append(
+            f"About {_format_duration(interval)} have passed since your last entry; "
+            f"this is entry {entry_no}."
+        )
     else:
-        lines.append("Interval since last reading: not applicable (first reading)")
+        lines.append("This is your first entry.")
 
-    lines.append("")
-    lines.append("Current readings:")
-    if metrics.get("uptime_s") is not None:
-        lines.append(f"- System uptime: {_format_duration(metrics['uptime_s'])}")
-    if "load1" in metrics:
+    changes = _interpret_changes(metrics, previous, s)
+    if changes:
+        lines.append("What is different since then: " + "; ".join(changes) + ".")
+    elif previous:
         lines.append(
-            f"- CPU load average (1/5/15 min): {metrics['load1']:.2f} / "
-            f"{metrics['load5']:.2f} / {metrics['load15']:.2f} across "
-            f"{metrics['cores']} cores"
+            "Nothing has changed in any way you can measure since then - the machine is still."
         )
-    util = _cpu_util(previous, metrics)
-    if util is not None:
-        lines.append(f"- CPU busy since last reading: {util * 100:.0f}%")
-    if "mem_used_mib" in metrics:
-        total = metrics["mem_total_mib"]
-        used = metrics["mem_used_mib"]
-        pct = 100 * used / total if total else 0
-        lines.append(f"- Memory: {used} MiB used of {total} MiB ({pct:.0f}%)")
-    if "disk_free_gb" in metrics:
-        lines.append(
-            f"- Storage: {metrics['disk_free_gb']} GB free of "
-            f"{metrics['disk_total_gb']} GB"
-        )
-    if "temp_max_c" in metrics:
-        lines.append(
-            f"- Temperature: {metrics['temp_zones']} thermal zones; hottest "
-            f"'{metrics['temp_max_zone']}' at {metrics['temp_max_c']:.1f} C"
-        )
-    if "power_w" in metrics:
-        lines.append(
-            f"- Power draw: {metrics['power_w']:.2f} W on the main board rail "
-            f"({metrics['volts']:.2f} V at {metrics['current_ma']} mA)"
-        )
-    if "cpu_mhz" in metrics:
-        lines.append(
-            f"- Processor clock: {metrics['cpu_mhz']} MHz of "
-            f"{metrics['cpu_max_mhz']} MHz maximum"
-        )
-    if "nproc" in metrics:
-        lines.append(f"- Active processes: {metrics['nproc']}")
 
-    # Measured change vs. the previous reading (real deltas, not invented).
-    if previous:
-        changes = []
-        if "load1" in metrics and "load1" in previous:
-            changes.append(
-                f"- CPU load (1 min): {_signed(metrics['load1'] - previous['load1'])}"
-            )
-        if "mem_used_mib" in metrics and "mem_used_mib" in previous:
-            changes.append(
-                "- Memory used: "
-                f"{_signed(metrics['mem_used_mib'] - previous['mem_used_mib'], '{:+d} MiB')}"
-            )
-        if "disk_free_gb" in metrics and "disk_free_gb" in previous:
-            changes.append(
-                "- Storage free: "
-                f"{_signed(metrics['disk_free_gb'] - previous['disk_free_gb'], '{:+.1f} GB')}"
-            )
-        if "temp_max_c" in metrics and "temp_max_c" in previous:
-            changes.append(
-                "- Hottest temperature: "
-                f"{_signed(metrics['temp_max_c'] - previous['temp_max_c'], '{:+.1f} C')}"
-            )
-        if "power_w" in metrics and "power_w" in previous:
-            changes.append(
-                "- Power draw: "
-                f"{_signed(metrics['power_w'] - previous['power_w'], '{:+.2f} W')}"
-            )
-        if "cpu_mhz" in metrics and "cpu_mhz" in previous:
-            changes.append(
-                "- Processor clock: "
-                f"{_signed(metrics['cpu_mhz'] - previous['cpu_mhz'], '{:+d} MHz')}"
-            )
-        if "nproc" in metrics and "nproc" in previous:
-            changes.append(
-                f"- Active processes: {_signed(metrics['nproc'] - previous['nproc'], '{:+d}')}"
-            )
-        if "sessions" in metrics and "sessions" in previous:
-            delta = metrics["sessions"] - previous["sessions"]
-            if delta:
-                changes.append(
-                    f"- Human login sessions: {_signed(delta, '{:+d}')} "
-                    "(someone arrived or left)"
-                )
-        if changes:
-            lines.append("")
-            lines.append("Measured change since last reading:")
-            lines.extend(changes)
-
-    lines.append("")
-    # Real presence sense, from active login sessions (not a guess).
     if "sessions" in metrics:
         if metrics["sessions"] == 0:
-            lines.append("Human presence: no one is logged in; you are alone")
+            lines.append("No one is here with you right now.")
         else:
-            detail = "; ".join(metrics.get("session_detail", metrics.get("users", [])))
-            lines.append(
-                f"Human presence: {metrics['sessions']} active login "
-                f"session(s) - {detail}"
-            )
-    else:
-        lines.append("Human presence: unknown (could not check logins)")
-    lines.append("System state: the machine continues running; Hannah is active")
+            who = ", ".join(metrics.get("users", [])) or "someone"
+            lines.append(f"{who} is here with you, logged in.")
+
     lines.append("")
     lines.append(load_task_prompt())
     return "\n".join(lines)
@@ -944,8 +905,10 @@ def build_messages(observation: str, cfg: dict) -> list:
         joined = "\n\n- - -\n\n".join(e["entry"] for e in recent)
         system += (
             "\n\nYour most recent journal entries (oldest first) - continue as the "
-            "same mind, aware of what you already wrote. Do not begin your entry "
-            f"with a date or timestamp:\n\n{joined}"
+            "same mind and voice, aware of what you already wrote. Do not begin "
+            "with a date or timestamp. Do NOT copy specific numbers from these "
+            "past entries, and do not treat any figure in them as still true now - "
+            f"only what you are told in this moment is current:\n\n{joined}"
         )
 
     return [
@@ -1055,9 +1018,12 @@ def wake_observation(cfg: dict):
 
 
 def reflect(observation: str, cfg: dict, metrics=None, note: str = "") -> None:
-    """Turn an observation into a journal entry: generate, log, remember."""
-    if note:
-        observation = f"Something drew your attention: {note}\n\n{observation}"
+    """Turn an observation into a journal entry: generate, log, remember.
+
+    'note' (the salience reason) is used only for operational logging - it is not
+    injected into the prompt, since the observation already expresses the change
+    in words.
+    """
     messages = build_messages(observation, cfg)
     model = selected_model_name(cfg)
     try:
@@ -1078,7 +1044,8 @@ def reflect(observation: str, cfg: dict, metrics=None, note: str = "") -> None:
     total = sum(1 for _ in MEMORY_FILE.open()) if MEMORY_FILE.exists() else 0
     if total and total % cfg["memory"]["themes_every"] == 0:
         update_themes(cfg)
-    _say(f"[entry] {response.splitlines()[0][:80] if response else '(empty)'}")
+    trigger = note or "heartbeat"
+    _say(f"[entry:{trigger}] {response.splitlines()[0][:80] if response else '(empty)'}")
 
 
 def run_daemon() -> None:

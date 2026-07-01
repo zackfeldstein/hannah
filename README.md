@@ -28,6 +28,10 @@ self-observation and watching what emerges.
 
 > Status: **early / in active development.** This is a prototype and an open experiment, not a product.
 
+She also comes with a small **web UI** — a calm, live window where you can watch
+her journal stream in, **edit her prompt**, and **switch models** from your
+browser. See [Web UI](#web-ui).
+
 ## Philosophy
 
 Hannah is a genuine experiment, not a metrics dashboard. She is handed her own
@@ -85,13 +89,46 @@ change** ("memory used: -4 MiB", "power: +0.30 W") instead of confabulating it.
 Everything is read from the Linux `/proc`, `/sys`, and `hwmon` interfaces. All
 readers fail soft, so a missing sensor never crashes a run.
 
+## Web UI
+
+Hannah ships with a small, **dependency-free web dashboard** (built on Python's
+standard-library `http.server`) — a calm window into her world that you can open
+from any browser on your network. It is the easiest way to experience the project.
+
+- **Live "now" panel** — current time, uptime, heat, power draw, CPU load and
+  clock, memory, who is logged in, and an awake / resting / offline indicator,
+  all refreshing every few seconds.
+- **Journal feed** — her entries newest-first, each stamped with an absolute
+  date/time, a relative "2m ago" label, and **the model that wrote it**.
+- **Edit her prompt in the browser** — change Hannah's voice and identity in a
+  live editor and hit **Save**; it takes effect on her very next entry, with no
+  restart and no touching the code. **Reset to default** is one click away.
+- **Pick the model** — switch between the configured models (e.g.
+  `qwen2.5-3b-instruct` and `qwen3-4b-thinking`) from a **dropdown**; the local
+  model server reloads with your choice automatically.
+
+Start it (installed as a user service alongside the daemon — see
+[Running continuously](#running-continuously-daemon)):
+
+```bash
+systemctl --user enable --now hannah-web.service
+# then open http://<this-machine-ip>:8600 in a browser
+```
+
+Host and port live in `config.json` under `web` (default `0.0.0.0:8600`, i.e.
+reachable across your LAN). It is read-only for viewing but **can edit the prompt
+and switch models**, so keep it on a trusted network — or set the host to
+`127.0.0.1` to make it local-only.
+
 ## Requirements
 
 - Linux host (developed on an **NVIDIA Jetson Orin Nano** running JetPack 6 /
   CUDA 12.6; the power/clock readers target Jetson, the rest is generic Linux)
 - [llama.cpp](https://github.com/ggml-org/llama.cpp) built with the
-  `llama-completion` binary (GPU build recommended)
-- A local GGUF model (default: `qwen2.5-3b-instruct-q4_k_m.gguf`)
+  `llama-server` binary (for the daemon + web UI) and `llama-completion` (for
+  one-shot runs); GPU build recommended
+- One or more local GGUF models (defaults: `qwen2.5-3b-instruct-q4_k_m.gguf`,
+  and optionally `Qwen3-4B-Thinking-2507-Q4_K_M.gguf`)
 - **Python 3.8+ — standard library only, no pip dependencies**
 
 ## Setup
@@ -104,9 +141,10 @@ cd ~/src/llama.cpp
 
 # Jetson Orin (Ampere, CUDA arch 8.7):
 cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=87 -DCMAKE_BUILD_TYPE=Release
-cmake --build build --target llama-completion -j4
+# llama-server powers the daemon + web UI; llama-completion is used for one-shot runs
+cmake --build build --target llama-server llama-completion -j4
 
-# (CPU-only: cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --target llama-completion -j4)
+# (CPU-only: drop -DGGML_CUDA=ON and -DCMAKE_CUDA_ARCHITECTURES=87)
 ```
 
 ### 2. Download a model
@@ -169,21 +207,23 @@ Hannah is designed to run as a persistent daemon rather than a one-shot script.
 As a daemon she keeps a warm model, remembers her recent entries, reacts to
 events as they happen, and notices her own downtime across restarts.
 
-Two systemd **user** services (see `systemd/`):
+Three systemd **user** services (see `systemd/`):
 
-- **`hannah-llama.service`** — runs `llama-server` with the model resident in
-  memory, serving a local HTTP endpoint.
+- **`hannah-llama.service`** — runs `llama-server` with the selected model
+  resident in memory, serving a local HTTP endpoint.
 - **`hannah.service`** — the daemon (`hannah.py --daemon`); depends on the server.
+- **`hannah-web.service`** — the [web UI](#web-ui) dashboard.
 
 Install and enable:
 
 ```bash
 mkdir -p ~/.config/systemd/user
-cp systemd/hannah-llama.service systemd/hannah.service ~/.config/systemd/user/
+cp systemd/hannah-llama.service systemd/hannah.service systemd/hannah-web.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 loginctl enable-linger "$USER"          # run at boot, without an active login
 systemctl --user enable --now hannah-llama.service
 systemctl --user enable --now hannah.service
+systemctl --user enable --now hannah-web.service
 ```
 
 How the daemon behaves (all tunable in `config.json`):
@@ -196,7 +236,8 @@ How the daemon behaves (all tunable in `config.json`):
 - **Downtime awareness** — on start she notices how long she was gone and whether
   the machine was actually powered off; on stop she writes a short farewell.
 
-Check on her:
+Check on her — the easiest way is the **[web UI](#web-ui)** at
+`http://<this-machine-ip>:8600`. From the shell:
 
 ```bash
 systemctl --user status hannah.service
