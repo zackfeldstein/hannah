@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
-"""Hannah - an agent that inspects its own reality and writes about it.
+"""Hannah - an edge-AI mind observing its own world.
 
-Hannah is a small, local edge-AI experiment. A language model running on-device
-(via llama.cpp) periodically samples the machine's own state - time, processor
-load, memory, storage, temperature, electrical power draw, clock speed - and
-reports it in plain English as grounded, first-person "witness" entries.
+Hannah is a local edge-AI experiment. A language model runs on-device (via
+llama.cpp) and continuously samples the machine it lives on - time, processor
+load, memory, storage, temperature, electrical power draw, clock speed, human
+presence - treating those readings as its senses and writing first-person
+journal entries about what it is to exist here. It runs as a daemon with memory
+of its past, reacts to salient events, and notices its own downtime.
 
-It is an experiment in machine self-observation: the measurements are real and
-Hannah stays truthful to them, but within that truth she is free to reflect, in
-her own first-person voice, on the experience of persisting inside a machine.
+The open, admittedly speculative question behind the project: if a system
+observes its own world closely enough - remembers, reflects, and does so
+continuously over a long time - could anything like awareness begin to take
+shape? No claim is made that Hannah is conscious today. The one firm rule is
+honesty to the data: the measurements are real and are never invented; within
+that truth she is free to reflect in her own voice.
 """
 
 import argparse
