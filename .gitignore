@@ -18,4 +18,5 @@ env/
 .vscode/
 .idea/
 *.swp
+*.bak
 .DS_Store
