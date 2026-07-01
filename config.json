@@ -1,13 +1,27 @@
 {
+  "models": {
+    "qwen2.5-3b-instruct": {
+      "path": "models/qwen2.5-3b-instruct-q4_k_m.gguf",
+      "tokens": 320
+    },
+    "qwen3-4b-thinking": {
+      "path": "models/Qwen3-4B-Thinking-2507-Q4_K_M.gguf",
+      "tokens": 2048
+    }
+  },
+  "model": "qwen2.5-3b-instruct",
   "server": {
     "url": "http://127.0.0.1:8080",
-    "timeout_s": 120,
-    "startup_wait_s": 180
+    "timeout_s": 240,
+    "startup_wait_s": 180,
+    "ctx": 8192
   },
   "generation": {
     "tokens": 320,
-    "temperature": 0.7,
+    "temperature": 0.9,
     "top_p": 0.9,
+    "top_k": 80,
+    "min_p": 0.05,
     "repeat_penalty": 1.12
   },
   "daemon": {

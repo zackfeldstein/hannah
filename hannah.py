@@ -19,6 +19,7 @@ that truth she is free to reflect in her own voice.
 import argparse
 import json
 import os
+import re
 import signal
 import subprocess
 import time
@@ -66,15 +67,31 @@ HEARTBEAT_FILE = LOG_DIR / "heartbeat.json"
 CONFIG_FILE = _env_path("HANNAH_CONFIG", BASE_DIR / "config.json")
 
 DEFAULT_CONFIG = {
+    # Available models (name -> {path, optional per-model max tokens}). The active
+    # one is chosen by "model" below, or overridden at runtime via the web UI.
+    "models": {
+        "qwen2.5-3b-instruct": {
+            "path": "models/qwen2.5-3b-instruct-q4_k_m.gguf",
+            "tokens": 320,
+        },
+        "qwen3-4b-thinking": {
+            "path": "models/Qwen3-4B-Thinking-2507-Q4_K_M.gguf",
+            "tokens": 2048,  # thinking models spend tokens reasoning before answering
+        },
+    },
+    "model": "qwen2.5-3b-instruct",
     "server": {
         "url": "http://127.0.0.1:8080",
-        "timeout_s": 120,
+        "timeout_s": 240,
         "startup_wait_s": 180,
+        "ctx": 8192,
     },
     "generation": {
         "tokens": 320,
-        "temperature": 0.7,
+        "temperature": 0.9,
         "top_p": 0.9,
+        "top_k": 80,
+        "min_p": 0.05,
         "repeat_penalty": 1.12,
     },
     "daemon": {
@@ -127,6 +144,71 @@ def load_config() -> dict:
     except (OSError, ValueError):
         user_cfg = {}
     return _deep_merge(DEFAULT_CONFIG, user_cfg)
+
+
+# --- Model selection ----------------------------------------------------------
+# Which model is active is stored in a small state file so the web UI can switch
+# it (and the llama-server launcher can read it) without editing config.json.
+SELECTED_MODEL_FILE = LOG_DIR / "selected_model"
+
+
+def list_models(cfg: dict) -> dict:
+    """Return the configured models map (name -> entry)."""
+    return cfg.get("models", {})
+
+
+def _model_entry(cfg: dict, name: str) -> dict:
+    """Normalize a model entry to a dict (a bare string is treated as its path)."""
+    entry = list_models(cfg).get(name)
+    if isinstance(entry, str):
+        return {"path": entry}
+    return entry or {}
+
+
+def _resolve_path(p: str) -> Path:
+    """Resolve a possibly-relative model path against the project directory."""
+    path = Path(p).expanduser()
+    return path if path.is_absolute() else (BASE_DIR / path)
+
+
+def selected_model_name(cfg: dict = None) -> str:
+    """The active model name: the web-selected one, else config default, else first."""
+    cfg = cfg or load_config()
+    models = list_models(cfg)
+    chosen = _read_text(SELECTED_MODEL_FILE)
+    if chosen and chosen in models:
+        return chosen
+    if cfg.get("model") in models:
+        return cfg["model"]
+    return next(iter(models), "")
+
+
+def selected_model_path(cfg: dict = None) -> str:
+    """Absolute path to the active model's GGUF (used by the server launcher)."""
+    cfg = cfg or load_config()
+    entry = _model_entry(cfg, selected_model_name(cfg))
+    return str(_resolve_path(entry.get("path", "")))
+
+
+def selected_model_tokens(cfg: dict):
+    """Per-model max-tokens override for the active model, or None."""
+    return _model_entry(cfg, selected_model_name(cfg)).get("tokens")
+
+
+def server_ctx(cfg: dict = None) -> int:
+    """Context window size for llama-server."""
+    cfg = cfg or load_config()
+    return int(cfg["server"].get("ctx", 4096))
+
+
+def set_selected_model(name: str, cfg: dict = None) -> bool:
+    """Persist the active model choice; returns False if the name is unknown."""
+    cfg = cfg or load_config()
+    if name not in list_models(cfg):
+        return False
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    SELECTED_MODEL_FILE.write_text(name)
+    return True
 
 # --- Prompts ------------------------------------------------------------------
 # The prompts live in editable plain-text files under prompts/ so you can tune
@@ -689,7 +771,8 @@ def _rotate_log(max_mb: float = 5, keep: int = 3) -> None:
     LOG_FILE.rename(LOG_FILE.with_suffix(LOG_FILE.suffix + ".1"))
 
 
-def append_log(observation: str, response: str, max_mb: float = 5, keep: int = 3) -> None:
+def append_log(observation: str, response: str, model: str = "",
+               max_mb: float = 5, keep: int = 3) -> None:
     """Append the observation and Hannah's entry to the log file (with rotation)."""
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     _rotate_log(max_mb, keep)
@@ -697,7 +780,8 @@ def append_log(observation: str, response: str, max_mb: float = 5, keep: int = 3
 
     entry = (
         "\n" + "-" * 60 + "\n"
-        f"Time: {timestamp}\n\n"
+        f"Time: {timestamp}\n"
+        f"Model: {model}\n\n"
         "Observation:\n"
         f"{observation}\n\n"
         "Hannah:\n"
@@ -735,14 +819,32 @@ def wait_for_server(cfg: dict) -> bool:
     return server_healthy(cfg)
 
 
+def _strip_thinking(text: str) -> str:
+    """Remove <think>...</think> reasoning blocks (from 'thinking' models)."""
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    return text.replace("<think>", "").replace("</think>", "").strip()
+
+
+def _clean_entry(text: str) -> str:
+    """Remove artifacts the model sometimes copies from the observation format:
+    parenthesized ISO timestamps like '(2026-06-30T23:44:01)' and any echoed
+    'Timestamp:' line at the very start of the entry."""
+    text = re.sub(r"\(\d{4}-\d{2}-\d{2}[T ][0-9:]+\)\s*", "", text)
+    text = re.sub(r"^\s*Timestamp:.*(?:\n|$)", "", text)
+    return text.strip()
+
+
 def run_llama_server(messages: list, cfg: dict) -> str:
     """Generate a reply from the persistent llama-server chat endpoint."""
     gen, srv = cfg["generation"], cfg["server"]
+    max_tokens = selected_model_tokens(cfg) or gen["tokens"]
     payload = {
         "messages": messages,
-        "max_tokens": gen["tokens"],
+        "max_tokens": max_tokens,
         "temperature": gen["temperature"],
         "top_p": gen["top_p"],
+        "top_k": gen.get("top_k", 40),
+        "min_p": gen.get("min_p", 0.05),
         "repeat_penalty": gen["repeat_penalty"],
         "stream": False,
     }
@@ -753,7 +855,15 @@ def run_llama_server(messages: list, cfg: dict) -> str:
     )
     with urllib.request.urlopen(req, timeout=srv["timeout_s"]) as resp:
         body = json.loads(resp.read().decode("utf-8"))
-    return body["choices"][0]["message"]["content"].strip()
+    msg = body["choices"][0]["message"]
+    # Thinking models: llama-server puts the answer in "content" and the private
+    # reasoning in "reasoning_content". Prefer the answer; fall back so we never
+    # log an empty entry. _strip_thinking handles models that inline <think>.
+    # Use the final answer only. For "thinking" models the reasoning lives in
+    # reasoning_content; we deliberately do NOT fall back to it, since raw
+    # reasoning is not a journal entry. An empty result signals "no usable answer".
+    content = (msg.get("content") or "").strip()
+    return _clean_entry(_strip_thinking(content))
 
 
 def load_recent_entries(n: int) -> list:
@@ -774,10 +884,14 @@ def load_recent_entries(n: int) -> list:
     return entries[-n:]
 
 
-def append_memory(entry_text: str) -> None:
+def append_memory(entry_text: str, model: str = "") -> None:
     """Record an entry into the rolling memory log."""
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    record = {"time": datetime.now().isoformat(timespec="seconds"), "entry": entry_text}
+    record = {
+        "time": datetime.now().isoformat(timespec="seconds"),
+        "entry": entry_text,
+        "model": model,
+    }
     with MEMORY_FILE.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record) + "\n")
 
@@ -797,13 +911,16 @@ def update_themes(cfg: dict) -> None:
         {
             "role": "system",
             "content": (
-                "You maintain a brief private note of the recurring themes in "
-                "Hannah's journal - the ongoing shape of her existence inside "
-                "this machine. In 2-3 sentences, first person, capture what has "
-                "been recurring or slowly changing. No numbers, just the throughline."
+                "You maintain a very short private note of the recurring themes in "
+                "Hannah's journal - the ongoing shape of her existence inside this "
+                "machine.\n"
+                "Write at most TWO short sentences, first person.\n"
+                "Do NOT list or mention any specific measurements, numbers, or "
+                "readings. Capture only the overall mood and throughline, not a "
+                "status report."
             ),
         },
-        {"role": "user", "content": f"Recent entries:\n\n{joined}\n\nUpdate the themes note."},
+        {"role": "user", "content": f"Recent entries:\n\n{joined}\n\nWrite the two-sentence themes note."},
     ]
     try:
         themes = run_llama_server(messages, cfg)
@@ -822,12 +939,13 @@ def build_messages(observation: str, cfg: dict) -> list:
 
     recent = load_recent_entries(cfg["memory"]["recent_entries"])
     if recent:
-        joined = "\n\n".join(
-            f"({e['time']})\n{e['entry']}" for e in recent
-        )
+        # Separate entries with a plain divider (no timestamp prefix) so the model
+        # doesn't copy a "(timestamp)" header into new entries.
+        joined = "\n\n- - -\n\n".join(e["entry"] for e in recent)
         system += (
             "\n\nYour most recent journal entries (oldest first) - continue as the "
-            f"same mind, aware of what you already wrote:\n\n{joined}"
+            "same mind, aware of what you already wrote. Do not begin your entry "
+            f"with a date or timestamp:\n\n{joined}"
         )
 
     return [
@@ -941,13 +1059,19 @@ def reflect(observation: str, cfg: dict, metrics=None, note: str = "") -> None:
     if note:
         observation = f"Something drew your attention: {note}\n\n{observation}"
     messages = build_messages(observation, cfg)
+    model = selected_model_name(cfg)
     try:
         response = run_llama_server(messages, cfg)
     except (urllib.error.URLError, OSError, KeyError, ValueError) as exc:
         _say(f"[warn] reflection failed: {exc}")
         return
-    append_log(observation, response, cfg["log"]["max_mb"], cfg["log"]["keep"])
-    append_memory(response)
+    if not response.strip():
+        # e.g. a thinking model that spent its whole budget reasoning; skip rather
+        # than log an empty or reasoning-only entry.
+        _say("[skip] model returned no final answer this cycle")
+        return
+    append_log(observation, response, model, cfg["log"]["max_mb"], cfg["log"]["keep"])
+    append_memory(response, model)
     if metrics is not None:
         save_snapshot(metrics)
     # Distill themes on a cadence tied to how many entries exist.

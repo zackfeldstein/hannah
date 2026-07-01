@@ -4,11 +4,8 @@ After=network.target
 
 [Service]
 Type=simple
-# CUDA runtime libs (Jetson); harmless if already in the linker cache.
-Environment=LD_LIBRARY_PATH=/usr/local/cuda/lib64
-ExecStart=%h/src/llama.cpp/build/bin/llama-server \
-    -m /ssd/repos/z-web/time-poc/models/qwen2.5-3b-instruct-q4_k_m.gguf \
-    -ngl 99 -c 4096 --host 127.0.0.1 --port 8080
+# The launcher picks whichever model Hannah currently has selected.
+ExecStart=/ssd/repos/z-web/time-poc/run_llama_server.sh
 Restart=always
 RestartSec=5
 
