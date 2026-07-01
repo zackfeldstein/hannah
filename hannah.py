@@ -89,6 +89,7 @@ DEFAULT_CONFIG = {
     "salience": {
         "temp_c": 3.0,          # thresholds that count as "something happened"
         "power_w": 0.5,
+        "cpu_util": 0.6,        # busy fraction since last sample (0..1) that is salient
         "load_frac_of_cores": 0.7,
         "mem_mib": 200,
         "nproc": 15,
@@ -376,6 +377,37 @@ def _log_history():
     return times
 
 
+def _cpu_stat_totals():
+    """Return (idle, total) CPU jiffies from /proc/stat's aggregate 'cpu' line.
+
+    Load average lags (1-min EMA); these raw counters let us compute actual
+    instantaneous utilization between two samples, which reacts within one tick.
+    """
+    text = _read_text("/proc/stat")
+    if not text:
+        return None
+    first = text.splitlines()[0].split()
+    if len(first) < 5 or first[0] != "cpu":
+        return None
+    try:
+        nums = [int(x) for x in first[1:]]
+    except ValueError:
+        return None
+    idle = nums[3] + (nums[4] if len(nums) > 4 else 0)  # idle + iowait
+    return idle, sum(nums)
+
+
+def _cpu_util(previous, metrics):
+    """Fraction of CPU time that was busy between two samples (0..1), or None."""
+    if not previous or "cpu_total" not in metrics or "cpu_total" not in previous:
+        return None
+    d_total = metrics["cpu_total"] - previous["cpu_total"]
+    d_idle = metrics["cpu_idle"] - previous["cpu_idle"]
+    if d_total <= 0:
+        return None
+    return max(0.0, min(1.0, 1 - d_idle / d_total))
+
+
 def collect_metrics() -> dict:
     """Sample the machine's current state into a flat dict of numbers/strings."""
     metrics = {"time": datetime.now().timestamp()}
@@ -388,6 +420,10 @@ def collect_metrics() -> dict:
         metrics["cores"] = os.cpu_count() or 1
     except (OSError, AttributeError):
         pass
+
+    cpu = _cpu_stat_totals()
+    if cpu is not None:
+        metrics["cpu_idle"], metrics["cpu_total"] = cpu
 
     mem = _meminfo()
     if mem and "MemTotal" in mem and "MemAvailable" in mem:
@@ -487,6 +523,9 @@ def render_observation(metrics: dict, previous, history) -> str:
             f"{metrics['load5']:.2f} / {metrics['load15']:.2f} across "
             f"{metrics['cores']} cores"
         )
+    util = _cpu_util(previous, metrics)
+    if util is not None:
+        lines.append(f"- CPU busy since last reading: {util * 100:.0f}%")
     if "mem_used_mib" in metrics:
         total = metrics["mem_total_mib"]
         used = metrics["mem_used_mib"]
@@ -823,6 +862,12 @@ def salience(metrics: dict, previous, cfg: dict):
     changed("mem_used_mib", s["mem_mib"], "memory", "{:+.0f} MiB")
     changed("nproc", s["nproc"], "processes", "{:+.0f}")
     changed("disk_free_gb", s["disk_gb"], "storage", "{:+.1f} GB")
+
+    # Instantaneous CPU utilization since the last sample: reacts within one tick,
+    # unlike the slow 1-minute load average.
+    util = _cpu_util(previous, metrics)
+    if util is not None and util >= s.get("cpu_util", 0.6):
+        reasons.append(f"CPU is busy ({util * 100:.0f}%)")
 
     if "load1" in metrics and "cores" in metrics:
         if metrics["load1"] >= s["load_frac_of_cores"] * metrics["cores"]:
