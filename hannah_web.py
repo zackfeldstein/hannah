@@ -407,6 +407,7 @@ class Handler(BaseHTTPRequestHandler):
         except OSError as exc:
             self._json({"ok": False, "error": str(exc)})
             return
+        hannah.ensure_prompt_archived()  # snapshot this prompt version for provenance
         self._json({"ok": True})
 
     def _switch_model(self) -> None:

@@ -17,6 +17,7 @@ that truth she is free to reflect in her own voice.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -61,6 +62,9 @@ STATE_FILE = LOG_DIR / "last_snapshot.json"
 MEMORY_FILE = LOG_DIR / "memory.jsonl"
 THEMES_FILE = LOG_DIR / "themes.txt"
 HEARTBEAT_FILE = LOG_DIR / "heartbeat.json"
+# Provenance: snapshots of each distinct prompt version that produced entries,
+# keyed by fingerprint, so research exports can trace an entry to its exact prompt.
+PROMPT_HISTORY_DIR = LOG_DIR / "prompt_history"
 
 # Runtime configuration lives in an editable JSON file (override with HANNAH_CONFIG).
 # The values below are the defaults, used for any key the file doesn't set.
@@ -122,6 +126,14 @@ DEFAULT_CONFIG = {
         "port": 8600,
         "cache_s": 5,           # cache live telemetry this long between requests
         "max_entries": 100,     # max journal entries the viewer will return
+    },
+    "analysis": {               # used by hannah_export.py --summarize
+        "provider": "openai",
+        "openai_model": "gpt-5.5",
+        "openai_base_url": "https://api.openai.com/v1",
+        "max_entries": 300,     # cap entries sent to the OpenAI model
+        "local_max_entries": 12,  # small cap - the local model's context is limited
+        "local_tokens": 1200,   # max tokens for a local-model summary
     },
 }
 
@@ -272,6 +284,34 @@ def load_system_prompt() -> str:
 def load_task_prompt() -> str:
     """The per-observation instruction (from prompts/task_prompt.txt)."""
     return _load_prompt(TASK_PROMPT_FILE, DEFAULT_TASK_PROMPT)
+
+
+def prompt_fingerprint() -> str:
+    """Short stable hash of the current system+task prompt (provenance key)."""
+    blob = (load_system_prompt() + "\x00" + load_task_prompt()).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()[:12]
+
+
+def ensure_prompt_archived() -> str:
+    """Snapshot the current prompt version (if new) and return its fingerprint.
+
+    Guarantees every prompt that ever produces an entry is captured verbatim,
+    however it was changed (web UI or file edit).
+    """
+    fp = prompt_fingerprint()
+    path = PROMPT_HISTORY_DIR / f"{fp}.json"
+    if not path.exists():
+        try:
+            PROMPT_HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({
+                "fingerprint": fp,
+                "first_seen": datetime.now().isoformat(timespec="seconds"),
+                "system_prompt": load_system_prompt(),
+                "task_prompt": load_task_prompt(),
+            }, indent=2))
+        except OSError:
+            pass
+    return fp
 
 
 def build_prompt(observation: str) -> str:
@@ -732,7 +772,7 @@ def _rotate_log(max_mb: float = 5, keep: int = 3) -> None:
     LOG_FILE.rename(LOG_FILE.with_suffix(LOG_FILE.suffix + ".1"))
 
 
-def append_log(observation: str, response: str, model: str = "",
+def append_log(observation: str, response: str, model: str = "", prompt_hash: str = "",
                max_mb: float = 5, keep: int = 3) -> None:
     """Append the observation and Hannah's entry to the log file (with rotation)."""
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -742,7 +782,8 @@ def append_log(observation: str, response: str, model: str = "",
     entry = (
         "\n" + "-" * 60 + "\n"
         f"Time: {timestamp}\n"
-        f"Model: {model}\n\n"
+        f"Model: {model}\n"
+        f"Prompt: {prompt_hash}\n\n"
         "Observation:\n"
         f"{observation}\n\n"
         "Hannah:\n"
@@ -845,13 +886,14 @@ def load_recent_entries(n: int) -> list:
     return entries[-n:]
 
 
-def append_memory(entry_text: str, model: str = "") -> None:
+def append_memory(entry_text: str, model: str = "", prompt_hash: str = "") -> None:
     """Record an entry into the rolling memory log."""
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     record = {
         "time": datetime.now().isoformat(timespec="seconds"),
         "entry": entry_text,
         "model": model,
+        "prompt": prompt_hash,
     }
     with MEMORY_FILE.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record) + "\n")
@@ -1026,6 +1068,7 @@ def reflect(observation: str, cfg: dict, metrics=None, note: str = "") -> None:
     """
     messages = build_messages(observation, cfg)
     model = selected_model_name(cfg)
+    prompt_hash = ensure_prompt_archived()
     try:
         response = run_llama_server(messages, cfg)
     except (urllib.error.URLError, OSError, KeyError, ValueError) as exc:
@@ -1036,8 +1079,9 @@ def reflect(observation: str, cfg: dict, metrics=None, note: str = "") -> None:
         # than log an empty or reasoning-only entry.
         _say("[skip] model returned no final answer this cycle")
         return
-    append_log(observation, response, model, cfg["log"]["max_mb"], cfg["log"]["keep"])
-    append_memory(response, model)
+    append_log(observation, response, model, prompt_hash,
+               cfg["log"]["max_mb"], cfg["log"]["keep"])
+    append_memory(response, model, prompt_hash)
     if metrics is not None:
         save_snapshot(metrics)
     # Distill themes on a cadence tied to how many entries exist.

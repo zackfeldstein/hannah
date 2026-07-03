@@ -1,6 +1,9 @@
 # Hannah's own output and memory (regenerated at runtime)
 logs/
 
+# Generated research export bundles
+research/
+
 # Local model weights - large GGUF files, not committed
 models/
 *.gguf

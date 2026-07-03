@@ -59,35 +59,42 @@ whether that mind ever becomes more than a mirror — is the whole point.
 
 ## How it works
 
+Each cycle of the daemon:
+
 ```
-collect_metrics()   ->  sample the machine's real state (/proc, /sys, hwmon)
+collect_metrics()    ->  sample the machine's real state (/proc, /sys, hwmon, who)
         |
-load_snapshot()     ->  read the previous reading from logs/last_snapshot.json
+salience()           ->  did anything worth noticing change since the last sample?
         |
-render_observation()->  build a text report incl. REAL measured deltas
+render_observation() ->  an interpreted, plain-language sense of the moment
+                         (time, what changed in words, who is present) - not a table
         |
-build_prompt()      ->  wrap it in a chat prompt with Hannah's system identity
+build_messages()     ->  system identity + rolling memory + this moment
         |
-run_llama()         ->  local LLM (llama.cpp) turns it into plain English
+llama-server         ->  the local LLM turns it into a first-person entry
         |
-append_log()        ->  save the observation + Hannah's entry; cache new snapshot
+append_log()/memory  ->  save the entry (+ model & prompt fingerprint), cache snapshot
 ```
 
-Because each run caches its readings, the next run can report **real, measured
-change** ("memory used: -4 MiB", "power: +0.30 W") instead of confabulating it.
+Each cycle caches its readings, so the next one can describe **real, measured
+change** ("grew warmer by 3 degrees", "someone arrived") instead of confabulating
+it. Crucially, Hannah is handed an *interpreted* sense of the moment rather than a
+dashboard of numbers, so she reflects on meaning instead of reciting values.
 
 ### What Hannah observes
 
-- **Time & continuity** — timestamp, uptime, entries recorded, age of the record,
-  interval since the last reading
-- **Activity** — CPU load average, active process count
+- **Time & continuity** — timestamp, uptime, entry count, interval since last entry
+- **Activity** — CPU load average, live CPU utilization since the last reading,
+  active process count
 - **Memory & storage** — RAM used/free, disk free
 - **Heat** — hottest thermal zone (°C)
-- **Electricity** — board power draw in watts (volts × amps, via the INA3221
-  power monitor), CPU clock speed
+- **Electricity** — board power draw in watts (via the INA3221 power monitor),
+  CPU clock speed
+- **Presence** — who is logged in (local or over SSH), so she notices company and
+  solitude, and when someone arrives or leaves
 
-Everything is read from the Linux `/proc`, `/sys`, and `hwmon` interfaces. All
-readers fail soft, so a missing sensor never crashes a run.
+Everything is read from the Linux `/proc`, `/sys`, and `hwmon` interfaces (plus
+`who`). All readers fail soft, so a missing sensor never crashes a run.
 
 ## Web UI
 
@@ -230,7 +237,8 @@ How the daemon behaves (all tunable in `config.json`):
 
 - **Hybrid cadence** — samples telemetry cheaply every ~20s, but only writes an
   entry when something *salient* happens (a login, a temperature/power/load jump,
-  etc.) or on a slow heartbeat (~15 min), debounced so bursts don't spam.
+  etc.) or on a slow heartbeat, debounced so bursts don't spam. All intervals and
+  thresholds are set in `config.json`.
 - **Rolling memory** — feeds her last few entries (and a periodically distilled
   "themes" note) back into each reflection, so she builds continuity over time.
 - **Downtime awareness** — on start she notices how long she was gone and whether
@@ -248,11 +256,99 @@ tail -f logs/hannah.log                  # the journal itself
 `logs/themes.txt`, and `logs/heartbeat.json` hold her working memory and lifecycle
 state. `run_hannah.sh` remains for one-off manual/cron runs if you want them.
 
+## Research export & analysis
+
+Hannah is built to be studied. `hannah_export.py` bundles a time range of her
+journal into a self-contained, reproducible folder — and can have an AI write a
+research summary that **tracks changes across successive runs**.
+
+### The workflow
+
+**1. Let Hannah run.** With the [daemon](#running-continuously-daemon) active she
+continuously writes entries to `logs/hannah.log` and `logs/memory.jsonl`.
+
+**2. Export a bundle** for the range you care about:
+
+```bash
+# Everything gathered so far
+python3 hannah_export.py --label baseline
+
+# Or a specific window
+python3 hannah_export.py --since 2026-07-01 --until 2026-07-03 --label cadence-test
+```
+
+Each export creates `research/<timestamp>_<label>/` containing:
+
+- **`manifest.json`** — export time, entry time range, entry count, **model
+  distribution**, **prompt-version distribution**, a snapshot of `config.json`
+  settings, host/JetPack info, and the git commit.
+- **`entries.jsonl`** — the structured entries in range (time, model, prompt hash, text).
+- **`journal.txt`** — the raw `hannah.log` slice (observations + entries) for the window.
+- **`prompts/`** — the current `system_prompt.txt` / `task_prompt.txt`, **plus the
+  exact archived prompt versions** that produced the entries.
+- **`report.md`** — a readable, shareable write-up of the metadata and entries.
+
+**3. Get an AI summary** by adding `--summarize`:
+
+```bash
+# Uses OpenAI if a key is set...
+export OPENAI_API_KEY=sk-...
+python3 hannah_export.py --label run1 --summarize
+
+# ...otherwise it automatically falls back to the local llama-server.
+python3 hannah_export.py --label run1 --summarize
+
+# Force the local model even when a key is present:
+python3 hannah_export.py --label run1 --summarize --local
+```
+
+This writes **`summary.md`** into the bundle — themes, notable events, how the
+voice evolved, model/prompt differences, anomalies, and suggested next
+experiments, citing entries by timestamp. If `OPENAI_API_KEY` is set it uses
+OpenAI; otherwise (or if the OpenAI call fails) it uses the local llama-server
+that already powers Hannah — so a summary works even fully offline. (The local
+model's context is small, so far fewer entries are analyzed on that path.)
+
+**4. Compare across runs — automatically.** The summary is also written to a
+stable file, **`research/latest_summary.md`**, and archived under
+`research/summaries/<timestamp>.md`. On the **next** `--summarize` run, Hannah
+feeds that previous summary to the analysis model as a baseline and adds a
+**"Changes since the previous analysis"** section — so each run tells you what is
+new and what shifted (including the effect of any model, prompt, or config change)
+without you diffing anything by hand.
+
+> Tip: to analyze only what's new since last time, pass `--since` with the previous
+> run's end time. To re-baseline, delete `research/latest_summary.md`.
+
+### Why not a vector database?
+
+For run-to-run *change tracking*, carrying forward the previous summary is simpler,
+cheaper, and more direct than a vector DB. A vector store solves a different
+problem — semantic *retrieval* across the whole corpus ("find every entry about
+overheating") — and would be worth adding only if/when you want that kind of
+search. It isn't needed for the diff-between-runs workflow.
+
+### Provenance
+
+Every entry records **which model and which prompt** produced it. The model name
+and a short prompt fingerprint are written to both `hannah.log` and
+`logs/memory.jsonl`, and each distinct prompt version is snapshotted verbatim to
+`logs/prompt_history/<fingerprint>.json` (the first time it is used, and whenever
+you Save a prompt in the web UI). That makes any entry fully traceable back to the
+exact model and prompt behind it.
+
+The OpenAI analysis model defaults to `gpt-5.5` (override with `--openai-model` or
+`config.json` → `analysis.openai_model`); the local fallback uses whichever model
+Hannah currently has loaded. Both paths use only the standard library, so there
+are still no third-party dependencies, and analysis works offline via the local
+model when there's no API key.
+
 ## Configuration
 
 Runtime behavior lives in `config.json` (override path with `HANNAH_CONFIG`):
-model server URL, generation settings (tokens, temperature…), daemon cadence,
-salience thresholds, memory depth, and log rotation. Any key you omit falls back
+available models and the active one, model server URL, generation settings
+(tokens, temperature…), daemon cadence, salience thresholds, memory depth, log
+rotation, web UI host/port, and the analysis model. Any key you omit falls back
 to the built-in defaults.
 
 ## Roadmap
@@ -262,6 +358,9 @@ to the built-in defaults.
 - Model-level continuity (persistent KV cache) for one unbroken unfolding session
 - Optional agentic mode: tool-calling so Hannah *chooses* what to introspect next,
   optionally exposed over MCP for external clients
+- Optional semantic memory: a vector store over past entries for retrieval/search
+  ("find every entry about overheating") — complementary to the run-to-run summary
+  diffing that already exists
 
 ## License
 
