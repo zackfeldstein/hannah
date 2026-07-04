@@ -1,23 +1,19 @@
 #!/usr/bin/env python3
-"""Experiment-oriented research workflow for Hannah.
+"""Experiment lifecycle for Hannah - reusable core + a thin CLI.
 
-Think in named runs, not date ranges:
+Think in named runs, not date ranges. The same functions power both this CLI and
+the web UI:
 
     python3 hannah_run.py start --label tools-on-v3
     python3 hannah_run.py status
     python3 hannah_run.py collect --summarize
 
-- start   : mark the beginning of an experiment, capturing the prompt, model,
-            tools setting, and code version in effect.
+- start   : begin an experiment, capturing the prompt, model, tools setting, and
+            code version in effect (and make sure the daemon is running).
 - status  : show the active run and how many entries it has gathered.
-- collect : stop the daemon, package everything since `start` into
-            research/runs/<label>/ (metadata + entries + journal + prompts +
-            report + summary), refresh research/INDEX.md and research/overview.md,
-            rotate the logs fresh (resetting rolling memory), then restart the daemon.
-
-Two files give you the whole picture without digging through folders:
-    research/INDEX.md      - a table of every run
-    research/overview.md   - an evolving summary of how Hannah changes across runs
+- collect : stop the daemon, package everything since start into
+            research/runs/<label>/, refresh research/INDEX.md + overview.md,
+            rotate the logs fresh (resetting rolling memory), then restart.
 """
 
 import argparse
@@ -37,7 +33,24 @@ INDEX = RESEARCH / "INDEX.md"
 OVERVIEW = RESEARCH / "overview.md"
 
 
-# --- helpers ------------------------------------------------------------------
+# --- daemon + git helpers -----------------------------------------------------
+
+def daemon_active() -> bool:
+    try:
+        r = subprocess.run(["systemctl", "--user", "is-active", "hannah.service"],
+                           capture_output=True, text=True, timeout=5)
+        return r.stdout.strip() == "active"
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def daemon_action(action: str, log=print) -> None:
+    try:
+        subprocess.run(["systemctl", "--user", action, "hannah.service"],
+                       capture_output=True, text=True, timeout=90)
+    except (OSError, subprocess.SubprocessError) as exc:
+        log(f"(could not {action} daemon: {exc})")
+
 
 def _git_info():
     commit = hx._git_commit()
@@ -51,23 +64,6 @@ def _git_info():
     return commit, dirty
 
 
-def _daemon_active() -> bool:
-    try:
-        r = subprocess.run(["systemctl", "--user", "is-active", "hannah.service"],
-                           capture_output=True, text=True, timeout=5)
-        return r.stdout.strip() == "active"
-    except (OSError, subprocess.SubprocessError):
-        return False
-
-
-def _daemon(action: str) -> None:
-    try:
-        subprocess.run(["systemctl", "--user", action, "hannah.service"],
-                       capture_output=True, text=True, timeout=90)
-    except (OSError, subprocess.SubprocessError) as exc:
-        print(f"  (could not {action} daemon: {exc})", flush=True)
-
-
 def _tool_stats(entries) -> dict:
     used, counts = 0, {}
     for e in entries:
@@ -76,28 +72,30 @@ def _tool_stats(entries) -> dict:
             used += 1
         for t in ts:
             counts[t] = counts.get(t, 0) + 1
-    return {
-        "entries_using_tools": used,
-        "tool_call_counts": dict(sorted(counts.items(), key=lambda kv: -kv[1])),
-    }
+    return {"entries_using_tools": used,
+            "tool_call_counts": dict(sorted(counts.items(), key=lambda kv: -kv[1]))}
 
 
-# --- commands -----------------------------------------------------------------
+# --- core API (used by both the CLI and the web UI) ---------------------------
 
-def cmd_start(args):
+def start_run(label: str, note: str = "", fresh: bool = False, cfg=None, log=print) -> dict:
+    """Begin an experiment. Ensures the daemon is running; optionally resets memory."""
+    cfg = cfg or hannah.load_config()
     RESEARCH.mkdir(parents=True, exist_ok=True)
     if CURRENT.exists():
         cur = json.loads(CURRENT.read_text())
-        raise SystemExit(
-            f"A run is already active: '{cur['label']}' (started {cur['started_at']}).\n"
-            "Collect it first:  python3 hannah_run.py collect --summarize"
-        )
-    cfg = hannah.load_config()
+        raise RuntimeError(f"A run is already active: '{cur['label']}'. Collect it first.")
+    if not daemon_active():
+        log("Starting daemon…")
+        daemon_action("start", log)
+    if fresh:
+        _reset_logs(reset_memory=True)
+        log("Reset logs and rolling memory for a clean start.")
     commit, dirty = _git_info()
     now = datetime.now()
     run = {
-        "label": args.label,
-        "note": args.note,
+        "label": label,
+        "note": note,
         "started_at": now.isoformat(timespec="seconds"),
         "started_ts": now.timestamp(),
         "model": hannah.selected_model_name(cfg),
@@ -109,45 +107,50 @@ def cmd_start(args):
         "git_dirty": dirty,
     }
     CURRENT.write_text(json.dumps(run, indent=2))
-    print(f"Started run '{run['label']}' at {run['started_at']}")
-    print(f"  model={run['model']}  tools={'on' if run['tools_enabled'] else 'off'}"
-          f"  prompt={run['prompt_fingerprint']}  commit={commit}{'*' if dirty else ''}")
-    print("Let Hannah run, then:  python3 hannah_run.py collect --summarize")
+    log(f"Started run '{label}' (model={run['model']}, tools="
+        f"{'on' if run['tools_enabled'] else 'off'}, prompt={run['prompt_fingerprint']}).")
+    return run
 
 
-def cmd_status(args):
+def active_run(cfg=None) -> dict:
+    """Return a light status dict for the active run, or None."""
     if not CURRENT.exists():
-        print("No active run. Start one with:  python3 hannah_run.py start --label <name>")
-        return
+        return None
     run = json.loads(CURRENT.read_text())
     since = datetime.fromtimestamp(run["started_ts"])
     entries = hx.load_entries(since, None)
-    elapsed = (datetime.now() - since).total_seconds()
-    print(f"Active run: {run['label']}")
-    print(f"  started : {run['started_at']}  ({hannah._format_duration(elapsed)} ago)")
-    print(f"  config  : model={run['model']}  tools={'on' if run['tools_enabled'] else 'off'}"
-          f"  prompt={run['prompt_fingerprint']}")
-    print(f"  entries : {len(entries)}  (using tools: {_tool_stats(entries)['entries_using_tools']})")
-    if hannah.prompt_fingerprint() != run["prompt_fingerprint"]:
-        print("  NOTE: the prompt has changed since this run started.")
+    return {
+        "label": run["label"],
+        "note": run.get("note", ""),
+        "started_at": run["started_at"],
+        "elapsed": hannah._format_duration((datetime.now() - since).total_seconds()),
+        "model": run["model"],
+        "tools_enabled": run["tools_enabled"],
+        "prompt_fingerprint": run["prompt_fingerprint"],
+        "entries_so_far": len(entries),
+        "entries_using_tools": _tool_stats(entries)["entries_using_tools"],
+        "prompt_changed": hannah.prompt_fingerprint() != run["prompt_fingerprint"],
+    }
 
 
-def cmd_collect(args):
+def collect_run(summarize: bool = True, local: bool = False, openai_model=None,
+                keep_memory: bool = False, restart: bool = True, cfg=None, log=print) -> dict:
+    """End the active run: package it, summarize, refresh index/overview, rotate logs."""
     if not CURRENT.exists():
-        raise SystemExit("No active run to collect. Start one first.")
+        raise RuntimeError("No active run to collect.")
     run = json.loads(CURRENT.read_text())
-    cfg = hannah.load_config()
+    cfg = cfg or hannah.load_config()
     since = datetime.fromtimestamp(run["started_ts"])
     now = datetime.now()
 
-    was_active = _daemon_active()
+    was_active = daemon_active()
     if was_active:
-        print("Stopping daemon…", flush=True)
-        _daemon("stop")
+        log("Stopping daemon…")
+        daemon_action("stop", log)
 
     entries = hx.load_entries(since, now)
     if not entries:
-        print("Warning: no entries in this run's window.", flush=True)
+        log("Warning: no entries in this run's window.")
 
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     safe = "".join(c if c.isalnum() or c in "-_" else "-" for c in run["label"])
@@ -172,7 +175,7 @@ def cmd_collect(args):
         "git_dirty": bool(run.get("git_dirty") or dirty_end),
         "tool_use": _tool_stats(entries),
     }
-    manifest.update(base_manifest)  # entry_count, models_used, ranges, host, etc.
+    manifest.update(base_manifest)
     (folder / "manifest.json").write_text(json.dumps(manifest, indent=2))
 
     with (folder / "entries.jsonl").open("w", encoding="utf-8") as f:
@@ -180,39 +183,156 @@ def cmd_collect(args):
             f.write(json.dumps(e) + "\n")
     (folder / "journal.txt").write_text(
         ("\n" + "-" * 60 + "\n").join(hx._log_blocks(since, now)), encoding="utf-8")
-    # Raw archives of the full logs as they stand at collection time.
     if hannah.LOG_FILE.exists():
         shutil.copy2(hannah.LOG_FILE, folder / "hannah.log")
     if hannah.MEMORY_FILE.exists():
         shutil.copy2(hannah.MEMORY_FILE, folder / "memory.jsonl")
-    # The prompt this run actually used (captured at start).
     (folder / "prompts" / "system_prompt.txt").write_text(run["system_prompt"], encoding="utf-8")
     (folder / "prompts" / "task_prompt.txt").write_text(run["task_prompt"], encoding="utf-8")
 
     hx.write_report(folder / "report.md", manifest, entries)
 
+    summary_model = None
     summary_text = None
-    if args.summarize and entries:
-        print("Generating run summary…", flush=True)
-        model, summary_text = hx.generate_summary(
-            entries, manifest, cfg, None, args.openai_model, args.local)
+    if summarize and entries:
+        log("Generating run summary…")
+        summary_model, summary_text = hx.generate_summary(
+            entries, manifest, cfg, None, openai_model, local)
         (folder / "summary.md").write_text(
-            f"# {run['label']} — summary (model: {model})\n\n{summary_text}\n", encoding="utf-8")
+            f"# {run['label']} — summary (model: {summary_model})\n\n{summary_text}\n",
+            encoding="utf-8")
 
-    # Rotate logs fresh (archives already saved into the run folder above).
-    _reset_logs(reset_memory=not args.keep_memory)
-
+    _reset_logs(reset_memory=not keep_memory)
     _rebuild_index()
     if summary_text is not None:
-        _update_overview(manifest, summary_text, cfg, args)
+        _update_overview(manifest, summary_text, cfg, local, openai_model, log)
 
     CURRENT.unlink()
-    print(f"Collected run '{run['label']}' → {folder}")
-    print("Logs rotated fresh." + ("" if args.keep_memory else " Rolling memory reset."))
+    log(f"Collected '{run['label']}' → {folder.name}. Logs rotated fresh"
+        f"{'' if keep_memory else ', memory reset'}.")
 
-    if was_active and not args.no_restart:
-        print("Restarting daemon…", flush=True)
-        _daemon("start")
+    if was_active and restart:
+        log("Restarting daemon…")
+        daemon_action("start", log)
+
+    return {
+        "label": run["label"],
+        "folder": folder.name,
+        "entries": len(entries),
+        "summary_model": summary_model,
+    }
+
+
+def list_runs() -> list:
+    """Summaries of all collected runs, newest first."""
+    runs = []
+    for mf in sorted(RUNS_DIR.glob("*/manifest.json")):
+        try:
+            m = json.loads(mf.read_text())
+        except (OSError, ValueError):
+            continue
+        runs.append({
+            "folder": mf.parent.name,
+            "label": m.get("label"),
+            "started_at": m.get("started_at"),
+            "ended_at": m.get("ended_at"),
+            "duration": m.get("duration"),
+            "model": m.get("model_at_start"),
+            "prompt": m.get("prompt_fingerprint"),
+            "tools_enabled": m.get("tools_enabled"),
+            "entries": m.get("entry_count"),
+            "tool_entries": m.get("tool_use", {}).get("entries_using_tools", 0),
+        })
+    runs.sort(key=lambda r: r.get("started_at") or "", reverse=True)
+    return runs
+
+
+def run_detail(folder: str) -> dict:
+    """Manifest + AI summary + any custom notes for one run folder."""
+    safe = Path(folder).name
+    d = RUNS_DIR / safe
+    manifest = {}
+    if (d / "manifest.json").exists():
+        try:
+            manifest = json.loads((d / "manifest.json").read_text())
+        except ValueError:
+            pass
+    summary = (d / "summary.md").read_text() if (d / "summary.md").exists() else ""
+    return {"manifest": manifest, "summary": summary, "notes": _read_notes(d)}
+
+
+def run_raw(folder: str, kind: str = "journal") -> str:
+    """Raw text for an experiment, for copy/paste. kind = 'journal' or 'entries'."""
+    d = RUNS_DIR / Path(folder).name
+    if kind == "entries":
+        ef = d / "entries.jsonl"
+        if not ef.exists():
+            return ""
+        # A compact, paste-ready block: a small context header + each entry.
+        header = ""
+        mf = d / "manifest.json"
+        if mf.exists():
+            try:
+                m = json.loads(mf.read_text())
+                header = (f"Experiment: {m.get('label')} | model: {m.get('model_at_start')} "
+                          f"| prompt: {m.get('prompt_fingerprint')} | tools: "
+                          f"{'on' if m.get('tools_enabled') else 'off'} | "
+                          f"{m.get('entry_count')} entries\n\n")
+            except ValueError:
+                pass
+        out = []
+        for line in ef.read_text(errors="ignore").splitlines():
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            out.append(f"[{r.get('time')}] {r.get('entry', '').strip()}")
+        return header + "\n\n".join(out)
+    jf = d / "journal.txt"
+    return jf.read_text(errors="ignore") if jf.exists() else ""
+
+
+def _read_notes(d: Path) -> list:
+    nf = d / "notes.json"
+    if nf.exists():
+        try:
+            return json.loads(nf.read_text())
+        except ValueError:
+            return []
+    return []
+
+
+def delete_run(folder: str) -> bool:
+    """Permanently remove an experiment folder (guarded to stay inside runs/)."""
+    d = RUNS_DIR / Path(folder).name
+    try:
+        resolved = d.resolve()
+        if resolved.parent != RUNS_DIR.resolve() or not resolved.is_dir():
+            return False
+        shutil.rmtree(resolved)
+    except OSError:
+        return False
+    _rebuild_index()
+    return True
+
+
+def add_note(folder: str, label: str, text: str) -> list:
+    """Attach a custom summary/note (e.g. a ChatGPT analysis) to an experiment."""
+    d = RUNS_DIR / Path(folder).name
+    if not d.exists():
+        raise RuntimeError("unknown experiment")
+    notes = _read_notes(d)
+    notes.append({
+        "label": label or "note",
+        "text": text,
+        "added_at": datetime.now().isoformat(timespec="seconds"),
+    })
+    (d / "notes.json").write_text(json.dumps(notes, indent=2), encoding="utf-8")
+    return notes
+
+
+def read_overview() -> str:
+    return OVERVIEW.read_text(encoding="utf-8") if OVERVIEW.exists() else ""
 
 
 # --- log rotation, index, overview -------------------------------------------
@@ -238,32 +358,23 @@ def _reset_logs(reset_memory: bool = True) -> None:
 
 
 def _rebuild_index() -> None:
-    rows = []
-    for mf in sorted(RUNS_DIR.glob("*/manifest.json")):
-        try:
-            rows.append(json.loads(mf.read_text()))
-        except (OSError, ValueError):
-            continue
-    rows.sort(key=lambda m: m.get("started_at", ""))
+    rows = sorted((list_runs()), key=lambda r: r.get("started_at") or "")
     lines = [
         "# Hannah — Experiment Index\n",
         "| Run | Started | Duration | Model | Prompt | Tools | Entries | Used tools |",
         "|---|---|---|---|---|---|---|---|",
     ]
     for m in rows:
-        tu = m.get("tool_use", {})
         lines.append(
-            f"| {m.get('label')} | {m.get('started_at')} | {m.get('duration')} | "
-            f"{m.get('model_at_start')} | `{m.get('prompt_fingerprint')}` | "
-            f"{'on' if m.get('tools_enabled') else 'off'} | {m.get('entry_count')} | "
-            f"{tu.get('entries_using_tools', 0)} |"
+            f"| {m['label']} | {m['started_at']} | {m['duration']} | {m['model']} | "
+            f"`{m['prompt']}` | {'on' if m['tools_enabled'] else 'off'} | "
+            f"{m['entries']} | {m['tool_entries']} |"
         )
     INDEX.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    print("Updated research/INDEX.md")
 
 
-def _update_overview(manifest, run_summary, cfg, args) -> None:
-    prev = OVERVIEW.read_text(encoding="utf-8") if OVERVIEW.exists() else ""
+def _update_overview(manifest, run_summary, cfg, local, openai_model, log=print) -> None:
+    prev = read_overview()
     keys = ["label", "started_at", "ended_at", "duration", "model_at_start",
             "tools_enabled", "prompt_fingerprint", "entry_count", "tool_use", "models_used"]
     meta = {k: manifest[k] for k in keys if k in manifest}
@@ -283,9 +394,9 @@ def _update_overview(manifest, run_summary, cfg, args) -> None:
     )
     messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
     try:
-        model, text = hx.run_analysis(messages, cfg, args.local, args.openai_model)
+        model, text = hx.run_analysis(messages, cfg, local, openai_model)
     except SystemExit as exc:
-        print(f"Overview update skipped: {exc}")
+        log(f"Overview update skipped: {exc}")
         return
     OVERVIEW.write_text(
         f"# Hannah — Evolving Overview\n\n"
@@ -293,28 +404,50 @@ def _update_overview(manifest, run_summary, cfg, args) -> None:
         f"{text}\n",
         encoding="utf-8",
     )
-    print("Updated research/overview.md")
+    log("Updated overview.")
+
+
+# --- CLI ----------------------------------------------------------------------
+
+def _cli_start(args):
+    start_run(args.label, args.note, args.fresh)
+    print("Let Hannah run, then:  python3 hannah_run.py collect --summarize")
+
+
+def _cli_status(args):
+    run = active_run()
+    if not run:
+        print("No active run. Start one with:  python3 hannah_run.py start --label <name>")
+        return
+    print(f"Active run: {run['label']}  ({run['elapsed']} ago)")
+    print(f"  model={run['model']}  tools={'on' if run['tools_enabled'] else 'off'}"
+          f"  prompt={run['prompt_fingerprint']}")
+    print(f"  entries: {run['entries_so_far']}  (using tools: {run['entries_using_tools']})")
+    if run["prompt_changed"]:
+        print("  NOTE: the prompt has changed since this run started.")
+
+
+def _cli_collect(args):
+    collect_run(summarize=args.summarize, local=args.local, openai_model=args.openai_model,
+                keep_memory=args.keep_memory, restart=not args.no_restart)
 
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Hannah experiment runner (start/status/collect).")
     sub = p.add_subparsers(dest="cmd", required=True)
-
     ps = sub.add_parser("start", help="Begin a named experiment.")
-    ps.add_argument("--label", required=True, help="Short name for the experiment.")
-    ps.add_argument("--note", default="", help="Optional description of the experiment.")
-
+    ps.add_argument("--label", required=True)
+    ps.add_argument("--note", default="")
+    ps.add_argument("--fresh", action="store_true", help="Reset logs/memory for a clean start.")
     sub.add_parser("status", help="Show the active run.")
-
     pc = sub.add_parser("collect", help="End the run, package it, refresh index/overview.")
-    pc.add_argument("--summarize", action="store_true", help="Generate a run summary + update overview.")
-    pc.add_argument("--local", action="store_true", help="Force the local model for analysis.")
-    pc.add_argument("--openai-model", help="Override the OpenAI analysis model.")
-    pc.add_argument("--keep-memory", action="store_true", help="Do not reset rolling memory.")
-    pc.add_argument("--no-restart", action="store_true", help="Do not restart the daemon afterward.")
-
+    pc.add_argument("--summarize", action="store_true")
+    pc.add_argument("--local", action="store_true")
+    pc.add_argument("--openai-model")
+    pc.add_argument("--keep-memory", action="store_true")
+    pc.add_argument("--no-restart", action="store_true")
     args = p.parse_args()
-    {"start": cmd_start, "status": cmd_status, "collect": cmd_collect}[args.cmd](args)
+    {"start": _cli_start, "status": _cli_status, "collect": _cli_collect}[args.cmd](args)
 
 
 if __name__ == "__main__":

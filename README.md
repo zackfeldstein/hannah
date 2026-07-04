@@ -99,20 +99,31 @@ Everything is read from the Linux `/proc`, `/sys`, and `hwmon` interfaces (plus
 ## Web UI
 
 Hannah ships with a small, **dependency-free web dashboard** (built on Python's
-standard-library `http.server`) — a calm window into her world that you can open
-from any browser on your network. It is the easiest way to experience the project.
+standard-library `http.server`) — the control center for the whole project. It is
+the easiest way to run and study Hannah; you rarely need the CLI or systemd
+directly.
 
 - **Live "now" panel** — current time, uptime, heat, power draw, CPU load and
   clock, memory, who is logged in, and an awake / resting / offline indicator,
   all refreshing every few seconds.
 - **Journal feed** — her entries newest-first, each stamped with an absolute
   date/time, a relative "2m ago" label, and **the model that wrote it**.
+- **Run experiments** — a **control panel** to **start/stop/restart the daemon**
+  and to **start a new experiment** (a label, optional "fresh start" that resets
+  her memory) and **stop it** — which packages the run, generates the summary, and
+  refreshes the index/overview, all in the background with live progress.
 - **Edit her prompt in the browser** — change Hannah's voice and identity in a
-  live editor and hit **Save**; it takes effect on her very next entry, with no
-  restart and no touching the code. **Reset to default** is one click away.
-- **Pick the model** — switch between the configured models (e.g.
-  `qwen2.5-3b-instruct` and `qwen3-4b-thinking`) from a **dropdown**; the local
-  model server reloads with your choice automatically.
+  live editor and hit **Save**; it takes effect on her very next entry.
+  **Reset to default** is one click away.
+- **Pick the model** — switch between the configured models from a **dropdown**;
+  the local model server reloads with your choice automatically.
+- **Browse experiments** — an **Experiments & overview** panel shows the evolving
+  cross-run `overview.md` and a table of every run; click one to read its summary.
+
+So the whole loop is web-driven: edit the prompt (or pick a model) → **Start
+experiment** → let her run → **Stop & collect** → read the summary/overview — all
+from the browser. The same lifecycle is available on the CLI (`hannah_run.py`) for
+scripting; both call the same core.
 
 Start it (installed as a user service alongside the daemon — see
 [Running continuously](#running-continuously-daemon)):

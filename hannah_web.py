@@ -11,12 +11,33 @@ Run directly (uses config.json for host/port):
 
 import json
 import subprocess
+import threading
 import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 import hannah
+import hannah_run as hr
+
+# Tracks a backgrounded "stop experiment" (collect) so the UI can poll progress.
+_collect = {"running": False, "log": [], "done": False, "error": None, "result": None}
+
+
+def _collect_worker(cfg, summarize, local):
+    _collect.update(running=True, done=False, error=None, result=None, log=[])
+
+    def log(msg):
+        _collect["log"].append(f"{datetime.now().strftime('%H:%M:%S')} {msg}")
+
+    try:
+        _collect["result"] = hr.collect_run(
+            summarize=summarize, local=local, cfg=cfg, log=log)
+    except Exception as exc:  # surface any failure to the UI
+        _collect["error"] = str(exc)
+        log(f"ERROR: {exc}")
+    finally:
+        _collect.update(running=False, done=True)
 
 # Cache live telemetry briefly so a refresh-happy browser can't spin sysfs/`who`.
 _now_cache = {"time": 0.0, "data": None}
@@ -142,6 +163,65 @@ PAGE = r"""<!DOCTYPE html>
   .ts .abs { color: #8b909b; }
   .ts .rel { color: #6b6f7a; }
   .ts .entry-model { color: #6f7d9a; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }
+
+  .control { border: 1px solid #23262e; border-radius: 12px; padding: 14px 16px; margin-bottom: 36px; background: #101217; }
+  .ctl-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 6px 0; }
+  .ctl-label { font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: #6b6f7a; min-width: 92px; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; color: #cdd0d7; }
+  .control input[type=text], .control input:not([type]) { background:#0a0b0e; color:#e2e4ea; border:1px solid #23262e; border-radius:8px; padding:6px 10px; font-size:13px; }
+  .control button { background:#1b2f22; color:#b6e6c6; border:1px solid #2a4a35; border-radius:8px; padding:6px 12px; font-size:13px; cursor:pointer; }
+  .control button.ghost { background:#14161b; color:#9aa0ad; border-color:#23262e; }
+  .control button:hover { filter: brightness(1.15); }
+  .control button:disabled { opacity:.5; cursor:default; }
+  .chk { font-size:12px; color:#8b909b; display:flex; align-items:center; gap:4px; }
+  .collectlog { margin-top:8px; background:#0a0b0e; border:1px solid #1c1e24; border-radius:8px; padding:10px; font-family: ui-monospace, monospace; font-size:11px; color:#8b909b; white-space:pre-wrap; max-height:160px; overflow:auto; }
+  .experiments > details > summary { cursor:pointer; color:#9aa0ad; font-size:13px; letter-spacing:.08em; text-transform:uppercase; }
+  .overview { white-space:pre-wrap; font-size:13px; color:#cdd0d7; background:#101217; border:1px solid #1c1e24; border-radius:10px; padding:14px; margin:12px 0; }
+  .exp-h { font-size:12px; letter-spacing:.08em; text-transform:uppercase; color:#6b6f7a; }
+  table.runs { width:100%; border-collapse:collapse; font-size:12px; }
+  table.runs th, table.runs td { text-align:left; padding:6px 8px; border-bottom:1px solid #1c1e24; }
+  table.runs tr { cursor:pointer; }
+  table.runs tr:hover td { background:#14161b; }
+  details.sub, details.exp-item { border:1px solid #1c1e24; border-radius:8px; margin:8px 0; background:#0d0f13; }
+  details.sub > summary, details.exp-item > summary { cursor:pointer; list-style:none; user-select:none; padding:9px 12px; font-size:12px; color:#cdd0d7; }
+  details.sub > summary::-webkit-details-marker, details.exp-item > summary::-webkit-details-marker { display:none; }
+  details.sub > summary::before, details.exp-item > summary::before { content:"\25B8  "; color:#6b6f7a; }
+  details.sub[open] > summary::before, details.exp-item[open] > summary::before { content:"\25BE  "; }
+  .exp-meta { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; color:#6b6f7a; padding:0 12px 6px; }
+  .exp-body { padding:0 12px 10px; }
+  .sub-body, .note-body { white-space:pre-wrap; font-size:12px; color:#cdd0d7; padding:0 12px 12px; }
+  .raw-ctl { display:flex; align-items:center; gap:8px; flex-wrap:wrap; padding:0 12px 12px; }
+  .raw-ctl button { background:#1b2f22; color:#b6e6c6; border:1px solid #2a4a35; border-radius:8px; padding:6px 12px; font-size:12px; cursor:pointer; }
+  .raw-ctl button.ghost { background:#14161b; color:#9aa0ad; border-color:#23262e; }
+  .raw-ctl button:hover { filter:brightness(1.15); }
+  textarea.rawfallback { display:none; width:calc(100% - 24px); margin:0 12px 12px; min-height:160px; background:#0a0b0e; color:#d9dbe1; border:1px solid #23262e; border-radius:8px; padding:10px; font-family: ui-monospace, monospace; font-size:11px; }
+  .note-form { display:flex; flex-direction:column; gap:8px; padding:6px 12px 12px; }
+  .note-form input { background:#0a0b0e; color:#e2e4ea; border:1px solid #23262e; border-radius:8px; padding:6px 10px; font-size:13px; }
+  .note-form textarea { background:#0a0b0e; color:#e2e4ea; border:1px solid #23262e; border-radius:8px; padding:10px; font-size:13px; min-height:120px; font-family: Georgia, serif; }
+  .note-form button { align-self:flex-start; background:#1b2f22; color:#b6e6c6; border:1px solid #2a4a35; border-radius:8px; padding:6px 14px; font-size:13px; cursor:pointer; }
+  .exp-actions { padding:8px 12px 12px; display:flex; align-items:center; gap:10px; }
+  button.danger { background:#2d1618; color:#e6b6b6; border:1px solid #4a2a2a; border-radius:8px; padding:6px 12px; font-size:12px; cursor:pointer; }
+  button.danger:hover { filter:brightness(1.2); }
+
+  /* Collapsible panels */
+  details.collapse { margin-bottom: 22px; }
+  details.collapse > summary,
+  details.content-panel > summary {
+    cursor:pointer; list-style:none; user-select:none; font-size:12px;
+    letter-spacing:.1em; text-transform:uppercase; color:#9aa0ad;
+  }
+  details.collapse > summary::-webkit-details-marker,
+  details.content-panel > summary::-webkit-details-marker { display:none; }
+  details.collapse > summary::before,
+  details.content-panel > summary::before { content:"\25B8  "; color:#6b6f7a; }
+  details.collapse[open] > summary::before,
+  details.content-panel[open] > summary::before { content:"\25BE  "; }
+  details.collapse > summary { padding:6px 0; border-bottom:1px solid #23262e; margin-bottom:12px; }
+  /* inside collapsible now/control, drop the inner card's own frame */
+  #nowpanel .now, #controlpanel .control { border:none; background:transparent; padding:0; margin:0; }
+  details.content-panel { border:1px solid #23262e; border-radius:12px; background:#101217; padding:2px 16px 4px; margin-bottom:22px; }
+  details.content-panel > summary { padding:12px 0; }
+  .experiments { margin:0; }
 </style>
 </head>
 <body>
@@ -151,7 +231,9 @@ PAGE = r"""<!DOCTYPE html>
       <div class="sub">a mind observing itself inside a machine</div>
     </header>
 
-    <section class="now" id="now">
+    <details class="collapse" id="nowpanel" open>
+      <summary>Now</summary>
+      <div class="now" id="now">
       <div class="line1">
         <span class="dot" id="dot"></span>
         <span class="status" id="status">connecting…</span>
@@ -168,10 +250,37 @@ PAGE = r"""<!DOCTYPE html>
         <span class="themes-label">Themes so far</span>
         <span id="themestext"></span>
       </div>
-    </section>
+      </div>
+    </details>
+
+    <details class="collapse" id="controlpanel" open>
+      <summary>Controls &amp; experiments</summary>
+      <section class="control">
+      <div class="ctl-row">
+        <span class="ctl-label">Daemon</span>
+        <span class="dot" id="ddot"></span><span id="dstate" class="mono">…</span>
+        <button id="dstart" class="ghost">Start</button>
+        <button id="dstop" class="ghost">Stop</button>
+        <button id="drestart" class="ghost">Restart</button>
+      </div>
+      <div class="ctl-row" id="newexp">
+        <span class="ctl-label">New experiment</span>
+        <input id="explabel" placeholder="label, e.g. tools-on-v3">
+        <label class="chk"><input type="checkbox" id="expfresh"> fresh start (reset memory)</label>
+        <button id="expstart">Start experiment</button>
+      </div>
+      <div class="ctl-row" id="activeexp" style="display:none">
+        <span class="ctl-label">Experiment</span>
+        <span id="expinfo" class="mono"></span>
+        <label class="chk"><input type="checkbox" id="expsum" checked> summarize</label>
+        <button id="expstop">Stop &amp; collect</button>
+      </div>
+      <div id="collectlog" class="collectlog" style="display:none"></div>
+      </section>
+    </details>
 
     <section class="editor">
-      <details id="promptBox">
+      <details class="content-panel" id="promptBox">
         <summary>Edit Hannah's system prompt</summary>
         <p class="hint">This is the voice and identity Hannah writes from. Edits are saved to
           <code>prompts/system_prompt.txt</code> and take effect on her next entry — no restart needed.</p>
@@ -188,12 +297,24 @@ PAGE = r"""<!DOCTYPE html>
       </details>
     </section>
 
-    <section class="feed">
-      <h2>Journal</h2>
+    <details class="content-panel" id="journalpanel" open>
+      <summary>Journal</summary>
       <div id="feed"><div class="empty">loading…</div></div>
+    </details>
+
+    <section class="experiments">
+      <details class="content-panel" id="expbox">
+        <summary>Experiments &amp; overview</summary>
+        <details class="sub" id="overviewbox">
+          <summary>Evolving overview</summary>
+          <div class="overview" id="overview">No overview yet — collect an experiment to generate one.</div>
+        </details>
+        <h3 class="exp-h">Experiments</h3>
+        <div id="runs"></div>
+      </details>
     </section>
 
-    <footer>read-only · refreshes every 5s</footer>
+    <footer>refreshes every 5s</footer>
   </div>
 
 <script>
@@ -243,11 +364,21 @@ async function refreshNow() {
     } else { th.style.display = 'none'; }
   } catch (e) { document.getElementById('status').textContent = 'offline'; }
 }
-async function refreshFeed() {
+var feedSig = "";
+async function refreshFeed(force) {
+  // Don't churn the feed when the panel is collapsed.
+  const panel = document.getElementById('journalpanel');
+  if (panel && !panel.open) return;
   try {
     const r = await fetch('/api/entries?limit=100'); const items = await r.json();
     const feed = document.getElementById('feed');
     if (!items.length) { feed.innerHTML = '<div class="empty">no entries yet</div>'; return; }
+    // Only rebuild when the data actually changed...
+    const sig = items.length + ':' + (items[0] ? items[0].time : '');
+    if (!force && sig === feedSig) return;
+    // ...and don't yank the page while you're scrolled down reading.
+    if (!force && feedSig && window.scrollY > 300) return;
+    feedSig = sig;
     feed.innerHTML = items.map(function(it) {
       var model = it.model ? ' \u00b7 <span class="entry-model">' + it.model + '</span>' : '';
       return '<div class="entry"><div class="ts"><span class="abs">' + fmtAbs(it.time) +
@@ -259,6 +390,17 @@ async function refreshFeed() {
     items.forEach(function(it, i) { bodies[i].textContent = it.entry; });
   } catch (e) {}
 }
+// Refresh the feed when its panel is opened (so it's current when you look).
+(function(){ var jp = document.getElementById('journalpanel');
+  if (jp) jp.addEventListener('toggle', function(){ if (jp.open) refreshFeed(true); }); })();
+// Accordion: opening one big panel closes the others, for one-thing-at-a-time focus.
+document.querySelectorAll('details.content-panel').forEach(function(d){
+  d.addEventListener('toggle', function(){
+    if (d.open) document.querySelectorAll('details.content-panel').forEach(function(o){
+      if (o !== d) o.open = false;
+    });
+  });
+});
 var DEFAULT_PROMPT = "";
 // Put each sentence on its own line: collapse existing line breaks, then break
 // after sentence-ending punctuation. Makes the prompt easy to read and edit.
@@ -322,7 +464,185 @@ document.getElementById('model').onchange = async function() {
 };
 loadModels();
 
-function tick() { refreshNow(); refreshFeed(); }
+async function postJSON(url, body) {
+  const r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body||{})});
+  return r.json();
+}
+document.getElementById('dstart').onclick = function(){ postJSON('/api/daemon',{action:'start'}).then(refreshExperiment); };
+document.getElementById('dstop').onclick = function(){ postJSON('/api/daemon',{action:'stop'}).then(refreshExperiment); };
+document.getElementById('drestart').onclick = function(){ postJSON('/api/daemon',{action:'restart'}).then(refreshExperiment); };
+document.getElementById('expstart').onclick = async function(){
+  const label = document.getElementById('explabel').value.trim();
+  if (!label) { alert('Enter a label for the experiment.'); return; }
+  const fresh = document.getElementById('expfresh').checked;
+  const d = await postJSON('/api/experiment/start', {label:label, fresh:fresh});
+  if (!d.ok) alert('Could not start: ' + (d.error||'failed'));
+  document.getElementById('explabel').value = '';
+  refreshExperiment();
+};
+document.getElementById('expstop').onclick = async function(){
+  const summarize = document.getElementById('expsum').checked;
+  this.disabled = true;
+  const d = await postJSON('/api/experiment/stop', {summarize:summarize});
+  if (!d.ok) { alert('Could not stop: ' + (d.error||'failed')); this.disabled = false; }
+  refreshExperiment();
+};
+async function refreshExperiment() {
+  try {
+    const r = await fetch('/api/experiment'); const d = await r.json();
+    const dot = document.getElementById('ddot');
+    dot.className = 'dot ' + (d.daemon_active ? 'awake' : 'offline');
+    document.getElementById('dstate').textContent = d.daemon_active ? 'running' : 'stopped';
+    const col = d.collecting || {};
+    const clog = document.getElementById('collectlog');
+    if (col.running || (col.done && col.log && col.log.length)) {
+      clog.style.display = 'block';
+      clog.textContent = (col.log||[]).join('\n') + (col.error ? ('\nERROR: '+col.error) : '');
+    } else { clog.style.display = 'none'; }
+    const active = d.active;
+    const newexp = document.getElementById('newexp');
+    const activeexp = document.getElementById('activeexp');
+    if (active) {
+      newexp.style.display = 'none'; activeexp.style.display = 'flex';
+      document.getElementById('expinfo').textContent =
+        active.label + '  ·  ' + active.elapsed + '  ·  ' + active.entries_so_far + ' entries'
+        + '  ·  ' + active.model + '  ·  tools ' + (active.tools_enabled?'on':'off')
+        + (active.prompt_changed ? '  ·  (prompt changed since start)' : '');
+      document.getElementById('expstop').disabled = !!col.running;
+    } else {
+      newexp.style.display = 'flex'; activeexp.style.display = 'none';
+      if (col.done && !col.running) loadRuns();  // a collect just finished
+    }
+  } catch (e) {}
+}
+async function loadOverview() {
+  try {
+    const r = await fetch('/api/overview'); const d = await r.json();
+    if (d.markdown) document.getElementById('overview').textContent = d.markdown;
+  } catch (e) {}
+}
+function esc(s) { return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+async function loadRuns() {
+  try {
+    const r = await fetch('/api/runs'); const runs = await r.json();
+    const el = document.getElementById('runs');
+    loadOverview();
+    if (!runs.length) { el.innerHTML = '<div class="empty">no experiments collected yet</div>'; return; }
+    el.innerHTML = runs.map(function(m){
+      var meta = (m.started_at||'') + ' \u00b7 ' + (m.duration||'') + ' \u00b7 ' + (m.model||'')
+               + ' \u00b7 tools ' + (m.tools_enabled?'on':'off') + ' \u00b7 ' + (m.entries||0) + ' entries';
+      return '<details class="exp-item" data-folder="' + esc(m.folder) + '">'
+           + '<summary>' + esc(m.label) + '</summary>'
+           + '<div class="exp-meta">' + esc(meta) + '</div>'
+           + '<div class="exp-body">loading…</div></details>';
+    }).join('');
+    el.querySelectorAll('details.exp-item').forEach(function(d){
+      d.addEventListener('toggle', function(){
+        if (d.open && !d.dataset.loaded) { d.dataset.loaded = '1'; showRun(d); }
+      });
+    });
+  } catch (e) {}
+}
+function copyText(text) {
+  if (navigator.clipboard && navigator.clipboard.writeText) return navigator.clipboard.writeText(text);
+  return new Promise(function(res, rej){
+    try {
+      var ta = document.createElement('textarea'); ta.value = text;
+      ta.style.position='fixed'; ta.style.opacity='0'; document.body.appendChild(ta);
+      ta.focus(); ta.select(); var ok = document.execCommand('copy'); document.body.removeChild(ta);
+      ok ? res() : rej();
+    } catch (e) { rej(e); }
+  });
+}
+function renderNotes(body, notes) {
+  const list = body.querySelector('.notes-list');
+  list.innerHTML = '';
+  if (!notes || !notes.length) { list.innerHTML = '<div class="empty">no custom summaries yet</div>'; return; }
+  notes.forEach(function(n){
+    const det = document.createElement('details'); det.className = 'sub note';
+    const sm = document.createElement('summary'); sm.textContent = n.label + '  ·  ' + (n.added_at || '');
+    const bd = document.createElement('div'); bd.className = 'note-body'; bd.textContent = n.text;
+    det.appendChild(sm); det.appendChild(bd); list.appendChild(det);
+  });
+}
+async function copyRaw(folder, kind, body) {
+  const st = body.querySelector('.cpStatus'); st.textContent = 'fetching…';
+  try {
+    const r = await fetch('/api/run/raw?folder=' + encodeURIComponent(folder) + '&kind=' + kind);
+    const d = await r.json(); const text = d.text || '';
+    try {
+      await copyText(text);
+      st.textContent = '\u2713 copied ' + text.length + ' chars';
+    } catch (e) {
+      // Clipboard blocked (e.g. plain-http LAN): show a textarea to copy manually.
+      st.textContent = 'select & copy below:';
+      let ta = body.querySelector('.rawfallback');
+      if (!ta) { ta = document.createElement('textarea'); ta.className = 'rawfallback'; body.querySelector('.raw-ctl').after(ta); }
+      ta.value = text; ta.style.display = 'block'; ta.focus(); ta.select();
+    }
+  } catch (e) { st.textContent = 'error fetching log'; }
+  setTimeout(function(){ st.textContent = ''; }, 8000);
+}
+async function saveNote(folder, body) {
+  const label = body.querySelector('.noteLabel').value.trim() || 'note';
+  const text = body.querySelector('.noteText').value.trim();
+  const st = body.querySelector('.noteStatus');
+  if (!text) { st.textContent = 'enter some text'; return; }
+  st.textContent = 'saving…';
+  try {
+    const r = await fetch('/api/run/note', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({folder: folder, label: label, text: text})});
+    const d = await r.json();
+    if (d.ok) {
+      st.textContent = '\u2713 saved';
+      body.querySelector('.noteText').value = ''; body.querySelector('.noteLabel').value = '';
+      renderNotes(body, d.notes || []);
+    } else { st.textContent = 'error: ' + (d.error || 'failed'); }
+  } catch (e) { st.textContent = 'error saving'; }
+  setTimeout(function(){ st.textContent = ''; }, 6000);
+}
+async function showRun(d) {
+  const folder = d.getAttribute('data-folder');
+  const body = d.querySelector('.exp-body');
+  body.innerHTML =
+      '<details class="sub" open><summary>AI summary</summary><div class="sub-body ai"></div></details>'
+    + '<details class="sub"><summary>Raw log (copy for ChatGPT)</summary>'
+    +   '<div class="raw-ctl"><button class="cpEntries">Copy entries</button>'
+    +   '<button class="cpJournal ghost">Copy full journal</button>'
+    +   '<span class="cpStatus mono"></span></div></details>'
+    + '<details class="sub"><summary>Custom summaries</summary>'
+    +   '<div class="notes-list"></div>'
+    +   '<div class="note-form"><input class="noteLabel" placeholder="label, e.g. ChatGPT">'
+    +   '<textarea class="noteText" placeholder="paste a custom summary…"></textarea>'
+    +   '<button class="noteSave">Add summary</button><span class="noteStatus mono"></span></div>'
+    + '</details>'
+    + '<div class="exp-actions"><button class="delRun danger">Delete experiment</button>'
+    +   '<span class="delStatus mono"></span></div>';
+  try {
+    const r = await fetch('/api/run?folder=' + encodeURIComponent(folder));
+    const data = await r.json();
+    body.querySelector('.ai').textContent = data.summary || '(no AI summary was generated)';
+    renderNotes(body, data.notes || []);
+  } catch (e) { body.querySelector('.ai').textContent = '(error loading experiment)'; }
+  body.querySelector('.cpEntries').onclick = function(){ copyRaw(folder, 'entries', body); };
+  body.querySelector('.cpJournal').onclick = function(){ copyRaw(folder, 'journal', body); };
+  body.querySelector('.noteSave').onclick = function(){ saveNote(folder, body); };
+  body.querySelector('.delRun').onclick = function(){ deleteRun(folder, d, body); };
+}
+async function deleteRun(folder, det, body) {
+  if (!confirm('Delete experiment "' + folder + '"? This permanently removes its folder.')) return;
+  const st = body.querySelector('.delStatus'); st.textContent = 'deleting…';
+  try {
+    const r = await fetch('/api/run/delete', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({folder: folder})});
+    const d = await r.json();
+    if (d.ok) { det.remove(); loadRuns(); }
+    else { st.textContent = 'error: ' + (d.error || 'failed'); }
+  } catch (e) { st.textContent = 'error deleting'; }
+}
+document.getElementById('expbox').addEventListener('toggle', function(){ if (this.open) loadRuns(); });
+
+function tick() { refreshNow(); refreshFeed(); refreshExperiment(); }
 tick();
 setInterval(tick, 5000);
 </script>
@@ -370,6 +690,31 @@ class Handler(BaseHTTPRequestHandler):
                 "models": list(hannah.list_models(self.cfg).keys()),
                 "current": hannah.selected_model_name(self.cfg),
             })
+        elif route.path == "/api/experiment":
+            self._json({
+                "active": hr.active_run(self.cfg),
+                "daemon_active": hr.daemon_active(),
+                "collecting": {
+                    "running": _collect["running"],
+                    "done": _collect["done"],
+                    "error": _collect["error"],
+                    "result": _collect["result"],
+                    "log": _collect["log"][-12:],
+                },
+            })
+        elif route.path == "/api/runs":
+            self._json(hr.list_runs())
+        elif route.path == "/api/run":
+            folder = parse_qs(route.query).get("folder", [""])[0]
+            self._json(hr.run_detail(folder) if folder else
+                       {"manifest": {}, "summary": "", "notes": []})
+        elif route.path == "/api/run/raw":
+            qs = parse_qs(route.query)
+            folder = qs.get("folder", [""])[0]
+            kind = qs.get("kind", ["journal"])[0]
+            self._json({"text": hr.run_raw(folder, kind) if folder else ""})
+        elif route.path == "/api/overview":
+            self._json({"markdown": hr.read_overview()})
         else:
             self._send(404, b"not found", "text/plain; charset=utf-8")
 
@@ -392,8 +737,74 @@ class Handler(BaseHTTPRequestHandler):
             self._save_prompt()
         elif route.path == "/api/model":
             self._switch_model()
+        elif route.path == "/api/daemon":
+            self._daemon_control()
+        elif route.path == "/api/experiment/start":
+            self._experiment_start()
+        elif route.path == "/api/experiment/stop":
+            self._experiment_stop()
+        elif route.path == "/api/run/note":
+            self._add_note()
+        elif route.path == "/api/run/delete":
+            folder = (self._read_json_body(max_len=500) or {}).get("folder", "").strip()
+            if not folder or not hr.delete_run(folder):
+                self._json({"ok": False, "error": "could not delete experiment"})
+            else:
+                self._json({"ok": True})
         else:
             self._send(404, b"not found", "text/plain; charset=utf-8")
+
+    def _add_note(self) -> None:
+        data = self._read_json_body(max_len=100000) or {}
+        folder = (data.get("folder") or "").strip()
+        text = (data.get("text") or "").strip()
+        label = (data.get("label") or "note").strip()
+        if not folder or not text:
+            self._json({"ok": False, "error": "folder and text are required"})
+            return
+        try:
+            notes = hr.add_note(folder, label, text)
+        except (RuntimeError, OSError) as exc:
+            self._json({"ok": False, "error": str(exc)})
+            return
+        self._json({"ok": True, "notes": notes})
+
+    def _daemon_control(self) -> None:
+        action = (self._read_json_body(max_len=200) or {}).get("action")
+        if action not in ("start", "stop", "restart"):
+            self._json({"ok": False, "error": "action must be start/stop/restart"})
+            return
+        hr.daemon_action(action)
+        self._json({"ok": True, "active": hr.daemon_active()})
+
+    def _experiment_start(self) -> None:
+        data = self._read_json_body(max_len=2000) or {}
+        label = (data.get("label") or "").strip()
+        if not label:
+            self._json({"ok": False, "error": "a label is required"})
+            return
+        try:
+            run = hr.start_run(label, data.get("note", ""), bool(data.get("fresh")), self.cfg)
+        except RuntimeError as exc:
+            self._json({"ok": False, "error": str(exc)})
+            return
+        self._json({"ok": True, "run": {"label": run["label"]}})
+
+    def _experiment_stop(self) -> None:
+        if _collect["running"]:
+            self._json({"ok": False, "error": "a collection is already in progress"})
+            return
+        if not hr.CURRENT.exists():
+            self._json({"ok": False, "error": "no active experiment to stop"})
+            return
+        data = self._read_json_body(max_len=500) or {}
+        summarize = data.get("summarize", True)
+        local = bool(data.get("local"))
+        # Collect can take a while (summary generation) - run it in the background.
+        threading.Thread(
+            target=_collect_worker, args=(self.cfg, summarize, local), daemon=True
+        ).start()
+        self._json({"ok": True, "started": True})
 
     def _save_prompt(self) -> None:
         data = self._read_json_body()
