@@ -26,12 +26,17 @@
   },
   "daemon": {
     "sense_tick_s": 20,
-    "heartbeat_s": 300,
+    "heartbeat_s": 120,
     "min_gap_s": 60
   },
   "memory": {
     "recent_entries": 6,
     "themes_every": 20
+  },
+  "tools": {
+    "enabled": true,
+    "max_calls": 3,
+    "output_chars": 1500
   },
   "salience": {
     "temp_c": 3.0,
@@ -58,7 +63,7 @@
     "openai_model": "gpt-5.5",
     "openai_base_url": "https://api.openai.com/v1",
     "max_entries": 300,
-    "local_max_entries": 12,
-    "local_tokens": 1200
+    "local_max_entries": 8,
+    "local_tokens": 1000
   }
 }

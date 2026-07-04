@@ -258,16 +258,47 @@ state. `run_hannah.sh` remains for one-off manual/cron runs if you want them.
 
 ## Research export & analysis
 
-Hannah is built to be studied. `hannah_export.py` bundles a time range of her
-journal into a self-contained, reproducible folder — and can have an AI write a
-research summary that **tracks changes across successive runs**.
+Hannah is built to be studied. There are two ways to pull data out: the
+**experiment-run workflow** (recommended — think in named experiments) and
+**ad-hoc exports** (arbitrary date ranges).
 
-### The workflow
+### Experiment runs (recommended): `hannah_run.py`
 
-**1. Let Hannah run.** With the [daemon](#running-continuously-daemon) active she
-continuously writes entries to `logs/hannah.log` and `logs/memory.jsonl`.
+Model your research as discrete **experiments** — "tools on, prompt v3" — instead
+of overlapping date folders. Three subcommands:
 
-**2. Export a bundle** for the range you care about:
+```bash
+# Begin an experiment: captures the prompt, model, tools setting, and git commit.
+python3 hannah_run.py start --label tools-on-v3 --note "first run with tools enabled"
+
+# Check in on it any time.
+python3 hannah_run.py status
+
+# End it: package everything since start, summarize, and start fresh.
+python3 hannah_run.py collect --summarize
+```
+
+`collect` does the whole cleanup for you: it stops the daemon, writes everything
+since `start` into **`research/runs/<label>/`** (manifest with prompt/model/tools/
+commit + entries + journal + prompt snapshot + report + `summary.md`, plus raw log
+archives), **rotates `hannah.log`/`memory.jsonl` fresh** (so the next experiment is
+clean and un-contaminated), then restarts the daemon. Flags: `--local` (force local
+analysis), `--keep-memory` (don't reset rolling memory), `--no-restart`.
+
+Two files then give you the whole picture — no folder-digging:
+
+- **`research/INDEX.md`** — a table of every experiment (label, dates, model,
+  prompt hash, tools on/off, entry count, how many entries used tools).
+- **`research/overview.md`** — an **evolving summary of how Hannah changes across
+  experiments** as you edit her prompt/model/tools. Each `collect` updates it by
+  comparing the new run against the running overview.
+
+Typical loop: edit her prompt (or toggle tools/model) → `start` → let her run →
+`collect --summarize` → read `overview.md` to see what changed.
+
+### Ad-hoc exports: `hannah_export.py`
+
+For a one-off dump of an arbitrary window (without the run lifecycle):
 
 ```bash
 # Everything gathered so far
@@ -288,7 +319,7 @@ Each export creates `research/<timestamp>_<label>/` containing:
   exact archived prompt versions** that produced the entries.
 - **`report.md`** — a readable, shareable write-up of the metadata and entries.
 
-**3. Get an AI summary** by adding `--summarize`:
+**AI summary** — add `--summarize`:
 
 ```bash
 # Uses OpenAI if a key is set...
@@ -309,7 +340,7 @@ OpenAI; otherwise (or if the OpenAI call fails) it uses the local llama-server
 that already powers Hannah — so a summary works even fully offline. (The local
 model's context is small, so far fewer entries are analyzed on that path.)
 
-**4. Compare across runs — automatically.** The summary is also written to a
+**Compare across exports — automatically.** The summary is also written to a
 stable file, **`research/latest_summary.md`**, and archived under
 `research/summaries/<timestamp>.md`. On the **next** `--summarize` run, Hannah
 feeds that previous summary to the analysis model as a baseline and adds a

@@ -222,6 +222,23 @@ def _analysis_messages(entries, manifest, cfg, prev_summary, cap):
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
+def _post_json(url, payload, headers, timeout):
+    """POST JSON and return the parsed response, surfacing the real error body."""
+    req = urllib.request.Request(
+        url, data=json.dumps(payload).encode("utf-8"), headers=headers
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = ""
+        try:
+            body = exc.read().decode("utf-8", "replace")
+        except Exception:
+            pass
+        raise RuntimeError(f"HTTP {exc.code}: {body.strip() or exc.reason}")
+
+
 def openai_summary(entries, manifest, cfg, model_override=None, prev_summary=None):
     """Produce a research analysis via OpenAI (stdlib urllib). Requires OPENAI_API_KEY."""
     api_key = os.environ.get("OPENAI_API_KEY")
@@ -233,25 +250,21 @@ def openai_summary(entries, manifest, cfg, model_override=None, prev_summary=Non
     messages = _analysis_messages(
         entries, manifest, cfg, prev_summary, acfg.get("max_entries", 300)
     )
-    payload = {"model": model, "messages": messages}
-    req = urllib.request.Request(
+    body = _post_json(
         base + "/chat/completions",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        },
+        {"model": model, "messages": messages},
+        {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+        timeout=300,
     )
-    with urllib.request.urlopen(req, timeout=300) as resp:
-        body = json.loads(resp.read().decode("utf-8"))
     return model, body["choices"][0]["message"]["content"].strip()
 
 
 def local_summary(entries, manifest, cfg, prev_summary=None):
     """Fallback analysis via the local llama-server.
 
-    The local model has a small context window, so far fewer entries are sent than
-    to OpenAI. Requires the llama-server (hannah-llama.service) to be running.
+    The local model's context is small, so we send few entries, a slimmed-down
+    manifest, and a truncated previous summary to stay within the window.
+    Requires the llama-server (hannah-llama.service) to be running.
     """
     acfg = cfg.get("analysis", {})
     if not hannah.server_healthy(cfg):
@@ -259,23 +272,65 @@ def local_summary(entries, manifest, cfg, prev_summary=None):
             "Local llama-server is not reachable. Start it (systemctl --user start "
             "hannah-llama.service) or set OPENAI_API_KEY for cloud analysis."
         )
+    # Keep the local prompt small to avoid overflowing the context window.
+    compact_manifest = {
+        "actual_range": manifest.get("actual_range"),
+        "entry_count": manifest.get("entry_count"),
+        "models_used": manifest.get("models_used"),
+        "prompt_versions_used": manifest.get("prompt_versions_used"),
+    }
+    prev = prev_summary[-1200:] if prev_summary else None
     messages = _analysis_messages(
-        entries, manifest, cfg, prev_summary, acfg.get("local_max_entries", 40)
+        entries, compact_manifest, cfg, prev, acfg.get("local_max_entries", 8)
     )
     srv = cfg["server"]
-    payload = {
-        "messages": messages,
-        "max_tokens": acfg.get("local_tokens", 1500),
-        "temperature": 0.4,
-        "stream": False,
-    }
-    req = urllib.request.Request(
+    body = _post_json(
         srv["url"].rstrip("/") + "/v1/chat/completions",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        {
+            "messages": messages,
+            "max_tokens": acfg.get("local_tokens", 1000),
+            "temperature": 0.4,
+            "stream": False,
+        },
+        {"Content-Type": "application/json"},
+        timeout=srv["timeout_s"],
     )
-    with urllib.request.urlopen(req, timeout=srv["timeout_s"]) as resp:
-        body = json.loads(resp.read().decode("utf-8"))
+    msg = body["choices"][0]["message"]
+    text = (msg.get("content") or "").strip() or (msg.get("reasoning_content") or "").strip()
+    return f"local:{hannah.selected_model_name(cfg)}", hannah._strip_thinking(text)
+
+
+def run_analysis(messages, cfg, force_local=False, openai_model=None):
+    """Run arbitrary analysis messages through OpenAI (or the local model).
+
+    Generic dispatcher (used e.g. for the cross-run overview): OpenAI when a key is
+    set, otherwise/upon failure the local llama-server. Returns (model_label, text).
+    """
+    acfg = cfg.get("analysis", {})
+    if not force_local and os.environ.get("OPENAI_API_KEY"):
+        try:
+            model = openai_model or acfg.get("openai_model", "gpt-5.5")
+            base = acfg.get("openai_base_url", "https://api.openai.com/v1").rstrip("/")
+            body = _post_json(
+                base + "/chat/completions",
+                {"model": model, "messages": messages},
+                {"Content-Type": "application/json",
+                 "Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}"},
+                timeout=300,
+            )
+            return model, body["choices"][0]["message"]["content"].strip()
+        except (urllib.error.URLError, OSError, ValueError, KeyError, RuntimeError) as exc:
+            print(f"OpenAI analysis failed ({exc}); falling back to the local model.", flush=True)
+    if not hannah.server_healthy(cfg):
+        raise SystemExit("Local llama-server unreachable and no working OpenAI key.")
+    srv = cfg["server"]
+    body = _post_json(
+        srv["url"].rstrip("/") + "/v1/chat/completions",
+        {"messages": messages, "max_tokens": acfg.get("local_tokens", 1000),
+         "temperature": 0.4, "stream": False},
+        {"Content-Type": "application/json"},
+        timeout=srv["timeout_s"],
+    )
     msg = body["choices"][0]["message"]
     text = (msg.get("content") or "").strip() or (msg.get("reasoning_content") or "").strip()
     return f"local:{hannah.selected_model_name(cfg)}", hannah._strip_thinking(text)

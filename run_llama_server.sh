@@ -17,5 +17,6 @@ MODEL=$(/usr/bin/python3 -c "import hannah; print(hannah.selected_model_path())"
 CTX=$(/usr/bin/python3 -c "import hannah; print(hannah.server_ctx())")
 
 echo "Starting llama-server with model: $MODEL (ctx $CTX)"
+# --jinja enables the model's chat template + OpenAI-style tool/function calling.
 exec "$HOME/src/llama.cpp/build/bin/llama-server" \
-    -m "$MODEL" -ngl 99 -c "$CTX" --host 127.0.0.1 --port 8080
+    -m "$MODEL" -ngl 99 -c "$CTX" --host 127.0.0.1 --port 8080 --jinja

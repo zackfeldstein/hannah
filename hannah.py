@@ -107,6 +107,11 @@ DEFAULT_CONFIG = {
         "recent_entries": 6,    # how many past entries to feed back as context
         "themes_every": 20,     # re-distill long-term "themes" every N entries
     },
+    "tools": {                  # read-only tools Hannah *may* call (she's not told to)
+        "enabled": True,
+        "max_calls": 3,         # max tool calls per entry before she must write
+        "output_chars": 1500,   # cap on each tool's returned output
+    },
     "salience": {
         "temp_c": 3.0,          # thresholds that count as "something happened"
         "power_w": 0.5,
@@ -132,8 +137,8 @@ DEFAULT_CONFIG = {
         "openai_model": "gpt-5.5",
         "openai_base_url": "https://api.openai.com/v1",
         "max_entries": 300,     # cap entries sent to the OpenAI model
-        "local_max_entries": 12,  # small cap - the local model's context is limited
-        "local_tokens": 1200,   # max tokens for a local-model summary
+        "local_max_entries": 8,  # small cap - the local model's context is limited
+        "local_tokens": 1000,   # max tokens for a local-model summary
     },
 }
 
@@ -773,11 +778,17 @@ def _rotate_log(max_mb: float = 5, keep: int = 3) -> None:
 
 
 def append_log(observation: str, response: str, model: str = "", prompt_hash: str = "",
-               max_mb: float = 5, keep: int = 3) -> None:
+               tools_trace=None, max_mb: float = 5, keep: int = 3) -> None:
     """Append the observation and Hannah's entry to the log file (with rotation)."""
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     _rotate_log(max_mb, keep)
     timestamp = datetime.now().isoformat(timespec="seconds")
+
+    tools_block = ""
+    if tools_trace:
+        tools_block = "\nTools used:\n" + "\n".join(
+            f"- {t['tool']}:\n{t['output']}" for t in tools_trace
+        ) + "\n"
 
     entry = (
         "\n" + "-" * 60 + "\n"
@@ -785,7 +796,8 @@ def append_log(observation: str, response: str, model: str = "", prompt_hash: st
         f"Model: {model}\n"
         f"Prompt: {prompt_hash}\n\n"
         "Observation:\n"
-        f"{observation}\n\n"
+        f"{observation}\n"
+        f"{tools_block}\n"
         "Hannah:\n"
         f"{response}\n"
     )
@@ -836,13 +848,16 @@ def _clean_entry(text: str) -> str:
     return text.strip()
 
 
-def run_llama_server(messages: list, cfg: dict) -> str:
-    """Generate a reply from the persistent llama-server chat endpoint."""
+def _server_chat(messages: list, cfg: dict, tools: list = None) -> dict:
+    """Low-level call to llama-server; returns the raw assistant message dict.
+
+    When `tools` are supplied, the message may contain `tool_calls` instead of a
+    final answer (requires llama-server started with --jinja).
+    """
     gen, srv = cfg["generation"], cfg["server"]
-    max_tokens = selected_model_tokens(cfg) or gen["tokens"]
     payload = {
         "messages": messages,
-        "max_tokens": max_tokens,
+        "max_tokens": selected_model_tokens(cfg) or gen["tokens"],
         "temperature": gen["temperature"],
         "top_p": gen["top_p"],
         "top_k": gen.get("top_k", 40),
@@ -850,6 +865,8 @@ def run_llama_server(messages: list, cfg: dict) -> str:
         "repeat_penalty": gen["repeat_penalty"],
         "stream": False,
     }
+    if tools:
+        payload["tools"] = tools
     req = urllib.request.Request(
         srv["url"].rstrip("/") + "/v1/chat/completions",
         data=json.dumps(payload).encode("utf-8"),
@@ -857,15 +874,83 @@ def run_llama_server(messages: list, cfg: dict) -> str:
     )
     with urllib.request.urlopen(req, timeout=srv["timeout_s"]) as resp:
         body = json.loads(resp.read().decode("utf-8"))
-    msg = body["choices"][0]["message"]
-    # Thinking models: llama-server puts the answer in "content" and the private
-    # reasoning in "reasoning_content". Prefer the answer; fall back so we never
-    # log an empty entry. _strip_thinking handles models that inline <think>.
-    # Use the final answer only. For "thinking" models the reasoning lives in
-    # reasoning_content; we deliberately do NOT fall back to it, since raw
-    # reasoning is not a journal entry. An empty result signals "no usable answer".
+    return body["choices"][0]["message"]
+
+
+def _message_text(msg: dict) -> str:
+    """Extract the cleaned final text from an assistant message."""
     content = (msg.get("content") or "").strip()
     return _clean_entry(_strip_thinking(content))
+
+
+def run_llama_server(messages: list, cfg: dict) -> str:
+    """Generate a plain-text reply (no tools) - used for themes/summaries."""
+    return _message_text(_server_chat(messages, cfg))
+
+
+# --- Tools: a small, read-only allowlist Hannah *may* choose to use -----------
+# Every tool is a fixed command run without a shell (no arguments from the model),
+# so there is no injection surface. They only read state; none can modify anything.
+TOOLS = {
+    "list_processes": {
+        "argv": ["ps", "-eo", "pid,pcpu,pmem,comm", "--sort=-pcpu"],
+        "head": 15,
+        "description": "List the running processes, busiest first (a snapshot).",
+    },
+    "memory_info": {
+        "argv": ["free", "-h"],
+        "description": "Show memory and swap usage.",
+    },
+    "disk_usage": {
+        "argv": ["df", "-h"],
+        "description": "Show filesystem disk-space usage.",
+    },
+    "network_stats": {
+        "argv": ["ss", "-s"],
+        "description": "Show a summary of network sockets/connections.",
+    },
+    "uptime": {
+        "argv": ["uptime"],
+        "description": "Show how long the system has run and its load averages.",
+    },
+    "who": {
+        "argv": ["who"],
+        "description": "Show who is currently logged in.",
+    },
+}
+
+
+def tool_schemas() -> list:
+    """OpenAI-style function schemas for the allowlisted tools (no parameters)."""
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": spec["description"],
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            },
+        }
+        for name, spec in TOOLS.items()
+    ]
+
+
+def run_tool(name: str, output_chars: int = 1500) -> str:
+    """Execute an allowlisted read-only tool and return its (capped) output."""
+    spec = TOOLS.get(name)
+    if not spec:
+        return f"(unknown tool: {name})"
+    try:
+        result = subprocess.run(
+            spec["argv"], capture_output=True, text=True, timeout=10,
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"(tool error: {exc})"
+    out = (result.stdout or result.stderr or "").strip()
+    if spec.get("head"):
+        out = "\n".join(out.splitlines()[: spec["head"]])
+    return out[:output_chars]
 
 
 def load_recent_entries(n: int) -> list:
@@ -886,7 +971,8 @@ def load_recent_entries(n: int) -> list:
     return entries[-n:]
 
 
-def append_memory(entry_text: str, model: str = "", prompt_hash: str = "") -> None:
+def append_memory(entry_text: str, model: str = "", prompt_hash: str = "",
+                  tools_trace=None) -> None:
     """Record an entry into the rolling memory log."""
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     record = {
@@ -894,6 +980,8 @@ def append_memory(entry_text: str, model: str = "", prompt_hash: str = "") -> No
         "entry": entry_text,
         "model": model,
         "prompt": prompt_hash,
+        # Names of any tools she chose to call this cycle (the exploration signal).
+        "tools": [t["tool"] for t in tools_trace] if tools_trace else [],
     }
     with MEMORY_FILE.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record) + "\n")
@@ -1070,8 +1158,8 @@ def reflect(observation: str, cfg: dict, metrics=None, note: str = "") -> None:
     model = selected_model_name(cfg)
     prompt_hash = ensure_prompt_archived()
     try:
-        response = run_llama_server(messages, cfg)
-    except (urllib.error.URLError, OSError, KeyError, ValueError) as exc:
+        response, trace = _reflect_loop(messages, cfg)
+    except (urllib.error.URLError, OSError, KeyError, ValueError, RuntimeError) as exc:
         _say(f"[warn] reflection failed: {exc}")
         return
     if not response.strip():
@@ -1079,9 +1167,9 @@ def reflect(observation: str, cfg: dict, metrics=None, note: str = "") -> None:
         # than log an empty or reasoning-only entry.
         _say("[skip] model returned no final answer this cycle")
         return
-    append_log(observation, response, model, prompt_hash,
+    append_log(observation, response, model, prompt_hash, trace,
                cfg["log"]["max_mb"], cfg["log"]["keep"])
-    append_memory(response, model, prompt_hash)
+    append_memory(response, model, prompt_hash, trace)
     if metrics is not None:
         save_snapshot(metrics)
     # Distill themes on a cadence tied to how many entries exist.
@@ -1089,7 +1177,47 @@ def reflect(observation: str, cfg: dict, metrics=None, note: str = "") -> None:
     if total and total % cfg["memory"]["themes_every"] == 0:
         update_themes(cfg)
     trigger = note or "heartbeat"
-    _say(f"[entry:{trigger}] {response.splitlines()[0][:80] if response else '(empty)'}")
+    used = f" [tools: {', '.join(t['tool'] for t in trace)}]" if trace else ""
+    _say(f"[entry:{trigger}]{used} {response.splitlines()[0][:80] if response else '(empty)'}")
+
+
+def _reflect_loop(messages: list, cfg: dict):
+    """Run the model, letting it optionally call read-only tools, then write.
+
+    Tools are made *available* but Hannah is never told to use them - whether she
+    explores is exactly what we're watching. Returns (final_text, tool_trace).
+    """
+    tcfg = cfg.get("tools", {})
+    tools = tool_schemas() if tcfg.get("enabled") else None
+    max_calls = tcfg.get("max_calls", 3)
+    trace = []
+
+    for step in range(max_calls + 1):
+        msg = _server_chat(messages, cfg, tools=tools if tools else None)
+        calls = msg.get("tool_calls") or []
+        if calls and step < max_calls:
+            # Record the assistant's tool-call turn, run each tool, feed results back.
+            messages.append({
+                "role": "assistant",
+                "content": msg.get("content") or "",
+                "tool_calls": calls,
+            })
+            for tc in calls:
+                fn = tc.get("function", {})
+                name = fn.get("name", "")
+                output = run_tool(name, tcfg.get("output_chars", 1500))
+                trace.append({"tool": name, "output": output})
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.get("id", ""),
+                    "name": name,
+                    "content": output,
+                })
+            continue
+        return _message_text(msg), trace
+
+    # Exhausted the tool budget: make one final call with tools disabled so she writes.
+    return _message_text(_server_chat(messages, cfg)), trace
 
 
 def run_daemon() -> None:
