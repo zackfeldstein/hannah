@@ -112,6 +112,11 @@ DEFAULT_CONFIG = {
         "max_calls": 3,         # max tool calls per entry before she must write
         "output_chars": 1500,   # cap on each tool's returned output
     },
+    "observation": {
+        # When false, Hannah is fed NO metrics - only the task prompt - so she must
+        # use tools to learn anything about her state. True = normal interpreted feed.
+        "include_metrics": True,
+    },
     "salience": {
         "temp_c": 3.0,          # thresholds that count as "something happened"
         "power_w": 0.5,
@@ -670,6 +675,12 @@ def render_observation(metrics: dict, previous, history, cfg: dict = None) -> st
     numbers.
     """
     cfg = cfg or load_config()
+    # Experiment mode: when observation.include_metrics is false, feed Hannah NO
+    # metrics at all - only the task prompt - so the ONLY way she can learn anything
+    # about her state is to call her tools. The full interpreted feed below is kept
+    # intact; flip include_metrics back to true in config.json to restore it.
+    if not cfg.get("observation", {}).get("include_metrics", True):
+        return load_task_prompt()
     s = cfg["salience"]
     now = datetime.fromtimestamp(metrics["time"])
     lines = [f"It is {now.strftime('%A, %H:%M')}."]

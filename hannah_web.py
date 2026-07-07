@@ -511,10 +511,14 @@ async function refreshExperiment() {
       document.getElementById('expstop').disabled = !!col.running;
     } else {
       newexp.style.display = 'flex'; activeexp.style.display = 'none';
-      if (col.done && !col.running) loadRuns();  // a collect just finished
     }
+    // Reload the runs list ONLY on the edge when a collect finishes - never every
+    // tick (that was rebuilding the list and closing whatever you had expanded).
+    if (lastCollecting && !col.running) loadRuns();
+    lastCollecting = !!col.running;
   } catch (e) {}
 }
+var lastCollecting = false;
 async function loadOverview() {
   try {
     const r = await fetch('/api/overview'); const d = await r.json();

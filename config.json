@@ -38,6 +38,9 @@
     "max_calls": 3,
     "output_chars": 1500
   },
+  "observation": {
+    "include_metrics": false
+  },
   "salience": {
     "temp_c": 3.0,
     "power_w": 0.5,
