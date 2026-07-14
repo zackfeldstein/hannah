@@ -4,6 +4,9 @@ logs/
 # Generated research export bundles
 research/
 
+# Generated public lab site (rebuild with: python3 hannah_lab.py build)
+public_lab/site/
+
 # Local model weights - large GGUF files, not committed
 models/
 *.gguf

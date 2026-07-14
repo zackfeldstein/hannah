@@ -111,6 +111,10 @@ DEFAULT_CONFIG = {
         "enabled": True,
         "max_calls": 3,         # max tool calls per entry before she must write
         "output_chars": 1500,   # cap on each tool's returned output
+        # Which tools to offer (subset of TOOLS). null/missing = all of them.
+        # Selectable per experiment via the web UI or hannah_run.py --tools;
+        # the runtime selection (logs/enabled_tools.json) overrides this.
+        "enabled_tools": None,
     },
     "observation": {
         # When false, Hannah is fed NO metrics - only the task prompt - so she must
@@ -136,6 +140,15 @@ DEFAULT_CONFIG = {
         "port": 8600,
         "cache_s": 5,           # cache live telemetry this long between requests
         "max_entries": 100,     # max journal entries the viewer will return
+    },
+    "lab": {                    # public Hannah Lab layer (hannah_lab.py)
+        "github_url": "https://github.com/zackfeldstein/hannah",
+        "auto_build": True,     # rebuild public_lab/site after each collect
+        "redact_terms": [],     # extra strings the sanitizer always redacts
+        "allow_public_ips": False,
+        "publish_target": "s3", # env vars HANNAH_* override these at publish time
+        "s3_bucket": "",
+        "aws_region": "",
     },
     "analysis": {               # used by hannah_export.py --summarize
         "provider": "openai",
@@ -931,8 +944,50 @@ TOOLS = {
 }
 
 
-def tool_schemas() -> list:
-    """OpenAI-style function schemas for the allowlisted tools (no parameters)."""
+# Which of the allowlisted tools are offered to Hannah is selectable per
+# experiment (via the web UI or `hannah_run.py start --tools ...`). The choice
+# is persisted like the model selection so the daemon picks it up on its next
+# cycle without a restart. Missing/invalid file = all tools.
+ENABLED_TOOLS_FILE = LOG_DIR / "enabled_tools.json"
+
+
+def enabled_tool_names(cfg: dict = None) -> list:
+    """The tools currently offered to Hannah, in TOOLS order.
+
+    Priority: the runtime selection file, else config tools.enabled_tools,
+    else every allowlisted tool.
+    """
+    cfg = cfg or load_config()
+    selected = None
+    try:
+        raw = json.loads(ENABLED_TOOLS_FILE.read_text())
+        if isinstance(raw, list):
+            selected = raw
+    except (OSError, ValueError):
+        pass
+    if selected is None:
+        from_cfg = cfg.get("tools", {}).get("enabled_tools")
+        selected = from_cfg if isinstance(from_cfg, list) else list(TOOLS)
+    return [name for name in TOOLS if name in selected]
+
+
+def set_enabled_tools(names, cfg: dict = None) -> bool:
+    """Persist which tools Hannah may use; returns False on unknown names.
+
+    An empty list is valid: Hannah runs with no tools at all (pure
+    reflection), which is itself an interesting experimental condition.
+    """
+    if not isinstance(names, (list, tuple)) or any(n not in TOOLS for n in names):
+        return False
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    ENABLED_TOOLS_FILE.write_text(json.dumps(
+        [n for n in TOOLS if n in names]))
+    return True
+
+
+def tool_schemas(cfg: dict = None) -> list:
+    """OpenAI-style function schemas for the currently enabled tools."""
+    enabled = set(enabled_tool_names(cfg))
     return [
         {
             "type": "function",
@@ -942,7 +997,7 @@ def tool_schemas() -> list:
                 "parameters": {"type": "object", "properties": {}, "required": []},
             },
         }
-        for name, spec in TOOLS.items()
+        for name, spec in TOOLS.items() if name in enabled
     ]
 
 
@@ -993,6 +1048,9 @@ def append_memory(entry_text: str, model: str = "", prompt_hash: str = "",
         "prompt": prompt_hash,
         # Names of any tools she chose to call this cycle (the exploration signal).
         "tools": [t["tool"] for t in tools_trace] if tools_trace else [],
+        # Full trace (tool + output) so the public lab can show the whole
+        # investigation path even after hannah.log rotates away.
+        "tool_trace": tools_trace or [],
     }
     with MEMORY_FILE.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record) + "\n")
@@ -1199,7 +1257,8 @@ def _reflect_loop(messages: list, cfg: dict):
     explores is exactly what we're watching. Returns (final_text, tool_trace).
     """
     tcfg = cfg.get("tools", {})
-    tools = tool_schemas() if tcfg.get("enabled") else None
+    enabled = enabled_tool_names(cfg)
+    tools = tool_schemas(cfg) if (tcfg.get("enabled") and enabled) else None
     max_calls = tcfg.get("max_calls", 3)
     trace = []
 
@@ -1216,7 +1275,13 @@ def _reflect_loop(messages: list, cfg: dict):
             for tc in calls:
                 fn = tc.get("function", {})
                 name = fn.get("name", "")
-                output = run_tool(name, tcfg.get("output_chars", 1500))
+                if name in enabled:
+                    output = run_tool(name, tcfg.get("output_chars", 1500))
+                else:
+                    # She called a tool she wasn't offered (hallucinated or
+                    # disabled for this experiment). Tell her honestly - the
+                    # miscall stays in the trace as a lab artifact.
+                    output = f"(unknown tool: {name})"
                 trace.append({"tool": name, "output": output})
                 messages.append({
                     "role": "tool",

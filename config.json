@@ -61,6 +61,15 @@
     "cache_s": 5,
     "max_entries": 100
   },
+  "lab": {
+    "github_url": "https://github.com/zackfeldstein/hannah",
+    "auto_build": true,
+    "redact_terms": [],
+    "allow_public_ips": false,
+    "publish_target": "s3",
+    "s3_bucket": "",
+    "aws_region": ""
+  },
   "analysis": {
     "provider": "openai",
     "openai_model": "gpt-5.5",

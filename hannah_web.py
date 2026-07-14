@@ -174,6 +174,14 @@ PAGE = r"""<!DOCTYPE html>
   .control button:hover { filter: brightness(1.15); }
   .control button:disabled { opacity:.5; cursor:default; }
   .chk { font-size:12px; color:#8b909b; display:flex; align-items:center; gap:4px; }
+  .toolchecks { display:flex; gap:4px 10px; flex-wrap:wrap; }
+  .toolchecks label { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size:11.5px; color:#8b909b; display:flex; align-items:center; gap:4px;
+    background:#0a0b0e; border:1px solid #23262e; border-radius:16px; padding:3px 10px 3px 6px;
+    cursor:pointer; user-select:none; }
+  .toolchecks label:hover { border-color:#3a5a45; }
+  .toolchecks label.on { color:#b6e6c6; border-color:#2a4a35; background:#14231b; }
+  .toolchecks input { accent-color:#4ad07d; margin:0; }
   .collectlog { margin-top:8px; background:#0a0b0e; border:1px solid #1c1e24; border-radius:8px; padding:10px; font-family: ui-monospace, monospace; font-size:11px; color:#8b909b; white-space:pre-wrap; max-height:160px; overflow:auto; }
   .experiments > details > summary { cursor:pointer; color:#9aa0ad; font-size:13px; letter-spacing:.08em; text-transform:uppercase; }
   .overview { white-space:pre-wrap; font-size:13px; color:#cdd0d7; background:#101217; border:1px solid #1c1e24; border-radius:10px; padding:14px; margin:12px 0; }
@@ -268,6 +276,11 @@ PAGE = r"""<!DOCTYPE html>
         <input id="explabel" placeholder="label, e.g. tools-on-v3">
         <label class="chk"><input type="checkbox" id="expfresh"> fresh start (reset memory)</label>
         <button id="expstart">Start experiment</button>
+      </div>
+      <div class="ctl-row" id="toolsrow">
+        <span class="ctl-label">Tools</span>
+        <span id="toolchecks" class="toolchecks"></span>
+        <span id="tstatus" class="pstatus"></span>
       </div>
       <div class="ctl-row" id="activeexp" style="display:none">
         <span class="ctl-label">Experiment</span>
@@ -448,6 +461,39 @@ async function loadModels() {
     }).join('');
   } catch (e) {}
 }
+// --- tool selection: which read-only tools Hannah is offered ---
+// Applies on her next entry; recorded in the run manifest at experiment start.
+async function loadTools() {
+  try {
+    const r = await fetch('/api/tools'); const d = await r.json();
+    const box = document.getElementById('toolchecks');
+    const enabled = d.enabled || [];
+    box.innerHTML = (d.tools || []).map(function(t) {
+      const on = enabled.indexOf(t) >= 0;
+      return '<label class="' + (on ? 'on' : '') + '" title="' + esc(d.descriptions[t] || '') + '">'
+           + '<input type="checkbox" value="' + t + '"' + (on ? ' checked' : '') + '>' + t + '</label>';
+    }).join('');
+    box.querySelectorAll('input').forEach(function(cb) { cb.onchange = saveTools; });
+  } catch (e) {}
+}
+async function saveTools() {
+  const box = document.getElementById('toolchecks');
+  const names = Array.from(box.querySelectorAll('input:checked')).map(function(cb){ return cb.value; });
+  const st = document.getElementById('tstatus');
+  st.textContent = 'saving…';
+  try {
+    const d = await postJSON('/api/tools', {tools: names});
+    st.textContent = d.ok ? ('\u2713 ' + (names.length ? names.length + ' tool(s) offered' : 'no tools — pure reflection')
+                             + ' — applies on her next entry')
+                          : ('error: ' + (d.error || 'failed'));
+    box.querySelectorAll('label').forEach(function(l) {
+      l.className = l.querySelector('input').checked ? 'on' : '';
+    });
+  } catch (e) { st.textContent = 'error saving'; }
+  setTimeout(function(){ st.textContent = ''; }, 6000);
+}
+loadTools();
+
 document.getElementById('model').onchange = async function() {
   const name = this.value;
   const st = document.getElementById('mstatus');
@@ -504,10 +550,14 @@ async function refreshExperiment() {
     const activeexp = document.getElementById('activeexp');
     if (active) {
       newexp.style.display = 'none'; activeexp.style.display = 'flex';
+      var toolsDesc = !active.tools_enabled ? 'off'
+        : ((active.tools_available && active.tools_available.length)
+            ? active.tools_available.join(', ') : 'none');
       document.getElementById('expinfo').textContent =
         active.label + '  ·  ' + active.elapsed + '  ·  ' + active.entries_so_far + ' entries'
-        + '  ·  ' + active.model + '  ·  tools ' + (active.tools_enabled?'on':'off')
-        + (active.prompt_changed ? '  ·  (prompt changed since start)' : '');
+        + '  ·  ' + active.model + '  ·  tools: ' + toolsDesc
+        + (active.prompt_changed ? '  ·  (prompt changed since start)' : '')
+        + (active.tools_changed ? '  ·  (tools changed since start)' : '');
       document.getElementById('expstop').disabled = !!col.running;
     } else {
       newexp.style.display = 'flex'; activeexp.style.display = 'none';
@@ -694,6 +744,13 @@ class Handler(BaseHTTPRequestHandler):
                 "models": list(hannah.list_models(self.cfg).keys()),
                 "current": hannah.selected_model_name(self.cfg),
             })
+        elif route.path == "/api/tools":
+            self._json({
+                "tools": list(hannah.TOOLS),
+                "enabled": hannah.enabled_tool_names(self.cfg),
+                "descriptions": {name: spec["description"]
+                                 for name, spec in hannah.TOOLS.items()},
+            })
         elif route.path == "/api/experiment":
             self._json({
                 "active": hr.active_run(self.cfg),
@@ -741,6 +798,8 @@ class Handler(BaseHTTPRequestHandler):
             self._save_prompt()
         elif route.path == "/api/model":
             self._switch_model()
+        elif route.path == "/api/tools":
+            self._set_tools()
         elif route.path == "/api/daemon":
             self._daemon_control()
         elif route.path == "/api/experiment/start":
@@ -824,6 +883,16 @@ class Handler(BaseHTTPRequestHandler):
             return
         hannah.ensure_prompt_archived()  # snapshot this prompt version for provenance
         self._json({"ok": True})
+
+    def _set_tools(self) -> None:
+        """Select which tools Hannah is offered. Takes effect on her next
+        entry (the daemon re-reads the selection every cycle)."""
+        data = self._read_json_body(max_len=2000)
+        names = (data or {}).get("tools")
+        if not isinstance(names, list) or not hannah.set_enabled_tools(names, self.cfg):
+            self._json({"ok": False, "error": "tools must be a list of known tool names"})
+            return
+        self._json({"ok": True, "enabled": hannah.enabled_tool_names(self.cfg)})
 
     def _switch_model(self) -> None:
         data = self._read_json_body(max_len=500)
