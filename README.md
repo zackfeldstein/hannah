@@ -117,6 +117,10 @@ directly.
   **Reset to default** is one click away.
 - **Pick the model** — switch between the configured models from a **dropdown**;
   the local model server reloads with your choice automatically.
+- **Select her tools** — checkboxes for each read-only tool Hannah may be
+  offered (unchecking all runs her with no tools at all — pure reflection).
+  Changes apply on her next entry and are recorded in the run manifest, so the
+  public lab shows exactly which tools each run had available.
 - **Browse experiments** — an **Experiments & overview** panel shows the evolving
   cross-run `overview.md` and a table of every run; click one to read its summary.
 
@@ -282,6 +286,10 @@ of overlapping date folders. Three subcommands:
 # Begin an experiment: captures the prompt, model, tools setting, and git commit.
 python3 hannah_run.py start --label tools-on-v3 --note "first run with tools enabled"
 
+# Choose which tools Hannah is offered for this run (subset, 'all', or 'none'):
+python3 hannah_run.py start --label memory-only --tools memory_info,uptime
+python3 hannah_run.py start --label pure-reflection --tools none
+
 # Check in on it any time.
 python3 hannah_run.py status
 
@@ -384,6 +392,114 @@ The OpenAI analysis model defaults to `gpt-5.5` (override with `--openai-model` 
 Hannah currently has loaded. Both paths use only the standard library, so there
 are still no third-party dependencies, and analysis works offline via the local
 model when there's no API key.
+
+## Hannah Lab — the public site
+
+Hannah Lab is the **public, read-only layer** around the private runtime: an
+open lab notebook where anyone can follow Hannah over time — inspect her runs,
+see which tools she chose, read her journals, browse derived memories and
+beliefs, review failures, and watch the system change. It is a static site,
+generated on the Jetson from collected runs and pushed **outbound only** to a
+cheap static host. Nothing on the public site can reach back into the machine,
+trigger Hannah, or send her prompts.
+
+```
+Jetson (private)                                    Static host (public)
+────────────────                                    ────────────────────
+hannah.py --daemon        runs locally, GPU inference stays home
+hannah_run.py collect  →  research/runs/<label>/    (private bundle)
+hannah_lab.py build    →  sanitize → derive state → research/runs/<label>/public/
+                          render   → public_lab/site/
+hannah_lab.py publish  →  aws s3 sync (outbound push)  →  the world reads it
+```
+
+There are two separate surfaces, and they never mix:
+
+- **Private control UI** (`hannah-web.service`, port 8600) — run Hannah, edit
+  prompts, start/stop experiments, see raw data. LAN-only; never expose it.
+- **Public lab site** (`public_lab/site/`) — sanitized, static, read-only.
+
+### Building and previewing
+
+```bash
+python3 hannah_lab.py build      # sanitize runs, derive state, render the site
+python3 hannah_lab.py preview    # serve it at http://<this-machine-ip>:8890/
+python3 hannah_lab.py check      # re-run the fail-closed sanitizer gate
+```
+
+`build` also runs automatically after every `hannah_run.py collect` (disable
+with `config.json → lab.auto_build`).
+
+### How the site is organized
+
+**Experiments are the spine of the lab.** Each experiment is a deliberate
+change to Hannah's conditions — prompt, senses, tools, model — and everything
+else lives inside the experiment that produced it:
+
+```
+index.html                          home: what Hannah is + experiments directory
+experiments/<name>/index.html       overview: goal, hypothesis, runs, findings
+experiments/<name>/journal.html     the experiment's journal feed
+experiments/<name>/runs.html        runs table
+experiments/<name>/runs/<id>.html   run detail: the full investigation path
+experiments/<name>/memory.html      memory derived from this experiment
+experiments/<name>/beliefs.html     belief state with confidence + contradictions
+experiments/<name>/questions.html   open questions (open/investigating/abandoned)
+experiments/<name>/timeline.html    event stream + what each run changed
+experiments/<name>/failures.html    the experiment's failure wall
+lab_state.json                      machine-readable snapshot of the whole lab
+```
+
+Derived state (memories, beliefs, questions, timeline) is computed **per
+experiment**, so each experiment reads as a self-contained investigation. The
+home page carries the cross-experiment picture: the experiments directory,
+lab-wide beliefs (with evidence links into each experiment's runs), and the
+latest activity.
+
+Annotate experiments — description, goal, hypothesis, notes, status — by
+editing `public_lab/experiments.json`; the registry is keyed by experiment
+name and merged in at build time.
+
+The run detail page shows the full investigation path: initial prompt,
+available tools, the tool calls Hannah chose, sanitized tool results, what the
+run changed in memory/beliefs/questions, score, failures. Each run also
+publishes raw artifacts (`public_manifest.json`, `journal.md`,
+`tool_trace.public.json`, `memory_changes.public.json`,
+`belief_changes.public.json`, `questions.public.json`, `score.json`,
+`failures.json`, `run_summary.json`) into `research/runs/<label>/public/`,
+copied alongside the run page.
+
+All derived state (memories, beliefs, questions, scores, failures) is computed
+**deterministically** from the sanitized run data — no model calls — so the
+whole site can be rebuilt from scratch at any time.
+
+### Sanitization (fail closed)
+
+Everything passes through `lab/sanitizer.py` before it can be published:
+
+- **Redacted** with placeholders: local usernames, the hostname, home paths,
+  private (and by default public) IPs, MAC addresses, model paths, plus any
+  custom strings in `config.json → lab.redact_terms`.
+- **Blocked** — if anything that looks like an actual secret survives (private
+  keys, AWS keys, API tokens, bearer headers, kubeconfig blobs, `.env`-style
+  assignments), the artifact is withheld and marked, and `publish` refuses to
+  upload. As a final gate, `check` re-scans every rendered file.
+
+### Publishing (optional, S3 for v1)
+
+```bash
+export HANNAH_PUBLISH_TARGET=s3
+export HANNAH_S3_BUCKET=hannah-lab-site
+export HANNAH_AWS_REGION=us-east-1     # optional
+
+python3 hannah_lab.py publish --dry-run   # see what would sync
+python3 hannah_lab.py publish             # build → check → aws s3 sync --delete
+```
+
+Credentials come from your normal AWS setup (env/profile); nothing is stored in
+the repo. The Jetson only ever pushes outbound — no ports opened, no inbound
+access, no cloud GPUs. Any static host works: sync `public_lab/site/` to
+GitHub Pages or Cloudflare Pages instead if you prefer.
 
 ## Configuration
 

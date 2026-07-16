@@ -78,13 +78,24 @@ def _tool_stats(entries) -> dict:
 
 # --- core API (used by both the CLI and the web UI) ---------------------------
 
-def start_run(label: str, note: str = "", fresh: bool = False, cfg=None, log=print) -> dict:
-    """Begin an experiment. Ensures the daemon is running; optionally resets memory."""
+def start_run(label: str, note: str = "", fresh: bool = False, cfg=None,
+              tools=None, log=print) -> dict:
+    """Begin an experiment. Ensures the daemon is running; optionally resets memory.
+
+    tools: optional list of tool names to offer Hannah for this run (a subset
+    of hannah.TOOLS; [] = no tools at all). None keeps the current selection.
+    """
     cfg = cfg or hannah.load_config()
     RESEARCH.mkdir(parents=True, exist_ok=True)
     if CURRENT.exists():
         cur = json.loads(CURRENT.read_text())
         raise RuntimeError(f"A run is already active: '{cur['label']}'. Collect it first.")
+    if tools is not None:
+        if not hannah.set_enabled_tools(tools, cfg):
+            unknown = [t for t in tools if t not in hannah.TOOLS]
+            raise RuntimeError(f"Unknown tool(s): {', '.join(unknown)}. "
+                               f"Available: {', '.join(hannah.TOOLS)}")
+        log(f"Tools for this run: {', '.join(tools) if tools else '(none)'}.")
     if not daemon_active():
         log("Starting daemon…")
         daemon_action("start", log)
@@ -100,6 +111,7 @@ def start_run(label: str, note: str = "", fresh: bool = False, cfg=None, log=pri
         "started_ts": now.timestamp(),
         "model": hannah.selected_model_name(cfg),
         "tools_enabled": cfg.get("tools", {}).get("enabled", False),
+        "tools_available": hannah.enabled_tool_names(cfg),
         "prompt_fingerprint": hannah.prompt_fingerprint(),
         "system_prompt": hannah.load_system_prompt(),
         "task_prompt": hannah.load_task_prompt(),
@@ -108,7 +120,9 @@ def start_run(label: str, note: str = "", fresh: bool = False, cfg=None, log=pri
     }
     CURRENT.write_text(json.dumps(run, indent=2))
     log(f"Started run '{label}' (model={run['model']}, tools="
-        f"{'on' if run['tools_enabled'] else 'off'}, prompt={run['prompt_fingerprint']}).")
+        f"{'on' if run['tools_enabled'] else 'off'} "
+        f"[{', '.join(run['tools_available']) or 'none'}], "
+        f"prompt={run['prompt_fingerprint']}).")
     return run
 
 
@@ -126,10 +140,15 @@ def active_run(cfg=None) -> dict:
         "elapsed": hannah._format_duration((datetime.now() - since).total_seconds()),
         "model": run["model"],
         "tools_enabled": run["tools_enabled"],
+        "tools_available": run.get("tools_available",
+                                   hannah.enabled_tool_names(cfg)),
         "prompt_fingerprint": run["prompt_fingerprint"],
         "entries_so_far": len(entries),
         "entries_using_tools": _tool_stats(entries)["entries_using_tools"],
         "prompt_changed": hannah.prompt_fingerprint() != run["prompt_fingerprint"],
+        "tools_changed": (run.get("tools_available") is not None
+                          and hannah.enabled_tool_names(cfg)
+                          != run["tools_available"]),
     }
 
 
@@ -169,6 +188,7 @@ def collect_run(summarize: bool = True, local: bool = False, openai_model=None,
         "duration": hannah._format_duration((now - since).total_seconds()),
         "model_at_start": run["model"],
         "tools_enabled": run["tools_enabled"],
+        "tools_available": run.get("tools_available"),
         "prompt_fingerprint": run["prompt_fingerprint"],
         "git_commit_start": run["git_commit"],
         "git_commit_end": commit_end,
@@ -206,6 +226,16 @@ def collect_run(summarize: bool = True, local: bool = False, openai_model=None,
     _rebuild_index()
     if summary_text is not None:
         _update_overview(manifest, summary_text, cfg, local, openai_model, log)
+
+    # Refresh the public lab (sanitized artifacts + static site). Build-only;
+    # publishing to a remote host stays an explicit, separate step.
+    if cfg.get("lab", {}).get("auto_build", True):
+        try:
+            import hannah_lab
+            log("Rebuilding the public lab site…")
+            hannah_lab.build(cfg, log=log)
+        except Exception as exc:  # the lab must never break a collect
+            log(f"(public lab build failed: {exc})")
 
     CURRENT.unlink()
     log(f"Collected '{run['label']}' → {folder.name}. Logs rotated fresh"
@@ -409,8 +439,20 @@ def _update_overview(manifest, run_summary, cfg, local, openai_model, log=print)
 
 # --- CLI ----------------------------------------------------------------------
 
+def _parse_tools(value):
+    """--tools 'a,b,c' -> list; 'all' -> every tool; 'none' -> []; None -> None."""
+    if value is None:
+        return None
+    value = value.strip().lower()
+    if value == "all":
+        return list(hannah.TOOLS)
+    if value in ("none", ""):
+        return []
+    return [t.strip() for t in value.split(",") if t.strip()]
+
+
 def _cli_start(args):
-    start_run(args.label, args.note, args.fresh)
+    start_run(args.label, args.note, args.fresh, tools=_parse_tools(args.tools))
     print("Let Hannah run, then:  python3 hannah_run.py collect --summarize")
 
 
@@ -421,6 +463,7 @@ def _cli_status(args):
         return
     print(f"Active run: {run['label']}  ({run['elapsed']} ago)")
     print(f"  model={run['model']}  tools={'on' if run['tools_enabled'] else 'off'}"
+          f" [{', '.join(run.get('tools_available', [])) or 'none'}]"
           f"  prompt={run['prompt_fingerprint']}")
     print(f"  entries: {run['entries_so_far']}  (using tools: {run['entries_using_tools']})")
     if run["prompt_changed"]:
@@ -439,6 +482,10 @@ def main() -> None:
     ps.add_argument("--label", required=True)
     ps.add_argument("--note", default="")
     ps.add_argument("--fresh", action="store_true", help="Reset logs/memory for a clean start.")
+    ps.add_argument("--tools", default=None, metavar="LIST",
+                    help="Tools to offer Hannah for this run: a comma-separated "
+                    f"subset of {{{','.join(hannah.TOOLS)}}}, 'all', or 'none'. "
+                    "Default: keep the current selection.")
     sub.add_parser("status", help="Show the active run.")
     pc = sub.add_parser("collect", help="End the run, package it, refresh index/overview.")
     pc.add_argument("--summarize", action="store_true")
