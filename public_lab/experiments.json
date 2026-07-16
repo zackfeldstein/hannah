@@ -8,5 +8,14 @@
     "description": "The telemetry feed is removed entirely (observation.include_metrics = false). Hannah wakes to a bare prompt; the only way she can learn anything about her environment is to investigate through tools.",
     "goal": "Test substrate observation: can Hannah build a picture of her environment purely from her own tool calls, and stay grounded in what they return?",
     "hypothesis": "Tool use becomes purposeful rather than incidental, but ungrounded claims increase whenever she writes without calling a tool that cycle."
+  },
+  "zack-test": {
+    "description": "not much",
+    "goal": "if it can become self aware",
+    "hypothesis": "repetivineess",
+    "status": "complete"
+  },
+  "wolf-chili": {
+    "status": "active"
   }
 }

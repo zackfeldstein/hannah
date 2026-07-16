@@ -38,7 +38,7 @@ import sys
 import threading
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 import hannah
 import hannah_run as hr
@@ -190,8 +190,11 @@ class LabControlHandler(SimpleHTTPRequestHandler):
 
     # -- routing --
     def do_GET(self):  # noqa: N802
-        if urlparse(self.path).path == "/api/lab/options":
+        path = urlparse(self.path).path
+        if path == "/api/lab/options":
             return self._options()
+        if path == "/api/lab/journal":
+            return self._journal()
         return super().do_GET()
 
     def do_POST(self):  # noqa: N802
@@ -223,6 +226,42 @@ class LabControlHandler(SimpleHTTPRequestHandler):
                            "error": _collect["error"],
                            "log": _collect["log"][-12:]},
         })
+
+    def _journal(self):
+        """Recent live journal entries of the running experiment, sanitized.
+
+        Reads the working memory the daemon is writing right now (before any
+        collect), so the live view shows what's happening this run. Entries
+        pass through the same sanitizer as the published lab.
+        """
+        qs = parse_qs(urlparse(self.path).query)
+        try:
+            limit = int(qs.get("limit", ["80"])[0])
+        except ValueError:
+            limit = 80
+        limit = max(1, min(limit, 300))
+        sanitizer = make_sanitizer(self.cfg)
+        entries = hannah.load_recent_entries(limit)
+        entries.reverse()  # newest first for the feed
+        out = []
+        for e in entries:
+            res = sanitizer.sanitize_text(e.get("entry", ""))
+            trace = []
+            for c in (e.get("tool_trace") or []):
+                tr = sanitizer.sanitize_text(c.get("output", ""))
+                trace.append({"tool": c.get("tool", ""),
+                              "output": tr.text if tr.publishable
+                              else "[withheld by sanitizer]"})
+            out.append({
+                "time": e.get("time"),
+                "entry": res.text if res.publishable
+                else "[withheld by sanitizer]",
+                "model": e.get("model", ""),
+                "prompt": e.get("prompt", ""),
+                "tools": e.get("tools") or [],
+                "tool_trace": trace,
+            })
+        self._json({"entries": out})
 
     def _create(self):
         data = self._read_json() or {}

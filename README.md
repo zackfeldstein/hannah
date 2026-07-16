@@ -443,6 +443,10 @@ with `config.json → lab.auto_build`).
 machine, the Experiments page can **create, delete, and stop-&-collect
 experiments** directly — the create form sets label, description/goal/
 hypothesis, model, tools, and prompt, exactly like the private control UI.
+A running experiment is marked **● live** on its tile and links to a
+**live view** (`live.html`) that streams its journal, tool calls, and counts
+in real time while it runs — so you can watch an experiment unfold before
+collecting it.
 These controls talk to a small `/api/lab/*` API that only exists while
 `preview` is running: they act on your local runtime, so keep preview on a
 trusted network (`--host 127.0.0.1` for local-only). The controls detect that

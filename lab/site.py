@@ -488,6 +488,14 @@ button.danger:hover { filter:brightness(1.04); }
   border-radius:50%; border:1px solid var(--border); background:#fff;
   color:var(--red); font-size:12px; line-height:1; cursor:pointer; padding:0; }
 .tile-del:hover { background:var(--red-soft); border-color:#eec7c9; }
+.tile.running { border-style:solid; border-color:var(--accent);
+  box-shadow:0 0 0 1px var(--accent) inset; opacity:1; }
+.running-badge { position:absolute; bottom:12px; right:12px; text-decoration:none;
+  background:var(--accent); color:#fff; font-size:11px; font-weight:600;
+  border-radius:16px; padding:3px 11px; }
+.running-badge:hover { filter:brightness(1.08); }
+.running-dot { color:var(--accent); animation:pulse 1.4s ease-in-out infinite; }
+@keyframes pulse { 0%,100%{opacity:1;} 50%{opacity:.35;} }
 </style>
 <div class="labctl" id="labctl" style="display:none">
   <div class="labctl-bar">
@@ -620,7 +628,39 @@ _EXP_CONTROLS_SCRIPT = """
     });
   }
 
+  function findTile(name){
+    var hit = null;
+    document.querySelectorAll('.tile').forEach(function(t){
+      if (t.getAttribute('data-exp') === name) hit = t; });
+    return hit;
+  }
+  function markRunning(o){
+    document.querySelectorAll('.tile.running').forEach(function(t){
+      t.classList.remove('running');
+      var b = t.querySelector('.running-badge'); if (b) b.remove(); });
+    if (!o.active) return;
+    var t = findTile(o.active.label);
+    if (!t) return;
+    t.classList.add('running');
+    if (!t.querySelector('.running-badge')){
+      var a = document.createElement('a');
+      a.className = 'running-badge'; a.href = 'live.html';
+      a.innerHTML = '<span class="running-dot">●</span> live';
+      t.appendChild(a);
+    }
+    // Pending tiles have no inner link — make the whole tile open the live view.
+    if (t.classList.contains('pending') && !t.dataset.livewired){
+      t.dataset.livewired = '1';
+      t.style.cursor = 'pointer';
+      t.addEventListener('click', function(ev){
+        if (ev.target.closest('.tile-del')) return;
+        location.href = 'live.html';
+      });
+    }
+  }
+
   function updateActive(o){
+    markRunning(o);
     var box = document.getElementById('activeBox');
     var newBtn = document.getElementById('newExpBtn');
     var col = o.collecting || {};
@@ -657,6 +697,146 @@ _EXP_CONTROLS_SCRIPT = """
       headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload||{}) })
       .then(function(r){ return r.json(); });
   }
+})();
+</script>"""
+
+
+# --- live view (running experiment, preview only) --------------------------------------
+
+def render_live_page(github):
+    """A real-time view of the currently running experiment.
+
+    Static shell only; all content is fetched at runtime from the local
+    control API, so this page shows data only while `hannah_lab.py preview`
+    is running (otherwise it explains that)."""
+    body = ["""<div class="pagehead">
+<h1 id="live-title">Live experiment</h1>
+<p class="pagesub" id="live-sub">A real-time view of the experiment that is
+running right now — its journal, tool calls, and counts as they happen. Live
+only while the local <span class="mono">hannah_lab.py preview</span> server is
+running.</p></div>
+<div id="live-root"><p class="muted">Loading…</p></div>""", _LIVE_SCRIPT]
+    return _page("Live", "\n".join(body), github=github, active="experiments",
+                 crumbs=[("Experiments", "experiments.html"), ("Live", None)])
+
+
+_LIVE_SCRIPT = """
+<script>
+(function(){
+  var API = '/api/lab';
+  var root = document.getElementById('live-root');
+  var timer = null;
+  function schedule(ms){ clearTimeout(timer); timer = setTimeout(load, ms); }
+  function esc(s){ return (s==null?'':String(s)).replace(/[&<>"]/g,
+    function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
+  function fmtTime(iso){ try { return new Date(iso).toLocaleString(undefined,
+    {month:'short',day:'numeric',hour:'numeric',minute:'2-digit',second:'2-digit'}); }
+    catch(e){ return esc(iso); } }
+  function card(n,l){ return '<div class="statcard"><div class="n">'+n
+    +'</div><div class="l">'+esc(l)+'</div></div>'; }
+  function meta(k,v){ return '<div><div class="k">'+esc(k)+'</div>'+v+'</div>'; }
+
+  function load(){
+    Promise.all([
+      fetch(API+'/options').then(function(r){ if(!r.ok) throw 0; return r.json(); }),
+      fetch(API+'/journal?limit=80').then(function(r){ return r.ok?r.json():{entries:[]}; })
+    ]).then(function(res){ render(res[0], res[1].entries || []); })
+      .catch(function(){
+        root.innerHTML = '<div class="panel"><h2>Live view unavailable</h2>'
+          + '<p class="muted">This page is live only while the local '
+          + '<span class="mono">hannah_lab.py preview</span> server is running. '
+          + '<a href="experiments.html">Back to experiments</a></p></div>';
+      });
+  }
+
+  function render(o, entries){
+    var col = o.collecting || {};
+    if (col.running){
+      root.innerHTML = '<div class="panel"><h2>Collecting…</h2><p class="muted">'
+        + esc((col.log && col.log.length) ? col.log[col.log.length-1]
+              : 'packaging the run') + '</p></div>';
+      schedule(1500); return;
+    }
+    if (col.done && !o.active){ location.href = 'experiments.html'; return; }
+    var a = o.active;
+    var title = document.getElementById('live-title');
+    var sub = document.getElementById('live-sub');
+    if (!a){
+      title.textContent = 'Nothing running';
+      sub.textContent = '';
+      root.innerHTML = '<div class="panel"><p class="muted">No experiment is '
+        + 'active right now. <a href="experiments.html">Browse experiments</a> '
+        + 'or start one there.</p></div>';
+      schedule(4000); return;
+    }
+    title.innerHTML = esc(a.label)
+      + ' <span class="chip ok"><span class="running-dot">●</span> running</span>';
+    sub.textContent = '';
+
+    var toolcalls = 0, usedcount = 0;
+    entries.forEach(function(e){
+      toolcalls += (e.tool_trace || []).length || (e.tools || []).length;
+      if ((e.tools || []).length) usedcount++;
+    });
+    var tools = (a.tools_available && a.tools_available.length)
+      ? a.tools_available.join(', ') : 'none';
+
+    var html = '<div class="statrow">'
+      + card(a.entries_so_far, 'entries so far')
+      + card(toolcalls, 'tool calls (recent)')
+      + card(usedcount, 'entries using tools')
+      + card(esc(a.elapsed), 'elapsed')
+      + '</div>';
+    html += '<div class="panel"><div class="metagrid">'
+      + meta('model', '<span class="mono">'+esc(a.model)+'</span>')
+      + meta('tools offered', esc(tools))
+      + meta('prompt', '<span class="mono">'+esc(a.prompt_fingerprint||'')+'</span>')
+      + meta('started', fmtTime(a.started_at))
+      + '</div><div style="margin-top:14px">'
+      + '<button class="danger" id="collectBtn">Stop &amp; collect</button> '
+      + '<span class="muted" id="livemsg"></span></div></div>';
+
+    html += '<h2 style="margin-top:24px">Live journal</h2>';
+    if (!entries.length){
+      html += '<p class="muted">No entries yet this run — waiting for her next '
+        + 'wake-up.</p>';
+    }
+    entries.forEach(function(e){
+      var chips = (e.tools || []).map(function(t){
+        return '<span class="chip tool-used">'+esc(t)+'</span>'; }).join('');
+      var trace = '';
+      if (e.tool_trace && e.tool_trace.length){
+        trace = '<details class="invest"><summary>'+e.tool_trace.length
+          + ' tool call'+(e.tool_trace.length!==1?'s':'')+'</summary>'
+          + '<div class="chips">'+chips+'</div><div class="body">'
+          + e.tool_trace.map(function(c){
+              return '<details><summary>'+esc(c.tool)+'</summary>'
+                + '<div class="body"><pre>'+esc(c.output)+'</pre></div></details>';
+            }).join('') + '</div></details>';
+      } else if (chips){ trace = '<div style="margin-top:8px">'+chips+'</div>'; }
+      html += '<article class="entry card"><div class="when">'+fmtTime(e.time)
+        + (e.model ? (' · '+esc(e.model)) : '') + '</div><div class="prose">'
+        + esc(e.entry) + '</div>' + trace + '</article>';
+    });
+    root.innerHTML = html;
+
+    var cb = document.getElementById('collectBtn');
+    if (cb) cb.onclick = function(){
+      if (!window.confirm('Stop the active experiment and collect it? This '
+        + 'packages the run, writes a summary, and resets rolling memory.')) return;
+      document.getElementById('livemsg').textContent = 'collecting…';
+      fetch(API+'/experiment/collect', { method:'POST',
+        headers:{'Content-Type':'application/json'}, body:'{}' })
+        .then(function(r){ return r.json(); }).then(function(d){
+          if (d.ok){ schedule(800); }
+          else { document.getElementById('livemsg').textContent =
+            'error: ' + (d.error||'failed'); }
+        });
+    };
+    schedule(4000);  // poll the running experiment
+  }
+
+  load();
 })();
 </script>"""
 
@@ -1092,6 +1272,8 @@ def build_site(groups, states, global_state, manifests: dict, site_dir: Path,
     (site_dir / "experiments.html").write_text(
         render_experiments_list(groups, registry, github),
         encoding="utf-8")
+    (site_dir / "live.html").write_text(
+        render_live_page(github), encoding="utf-8")
 
     for g in groups:
         name = g["name"]
