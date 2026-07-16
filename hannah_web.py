@@ -174,6 +174,31 @@ PAGE = r"""<!DOCTYPE html>
   .control button:hover { filter: brightness(1.15); }
   .control button:disabled { opacity:.5; cursor:default; }
   .chk { font-size:12px; color:#8b909b; display:flex; align-items:center; gap:4px; }
+  .expform { border:1px solid #23262e; border-radius:10px; background:#0d0f13;
+    padding:14px 16px; margin:10px 0; }
+  .ef-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px 14px; margin-bottom:12px; }
+  .ef-grid label { display:flex; flex-direction:column; gap:4px; font-size:11px;
+    letter-spacing:.08em; text-transform:uppercase; color:#6b6f7a; }
+  .ef-grid label.wide { grid-column:1 / -1; }
+  .ef-grid input, .ef-grid select { background:#0a0b0e; color:#e2e4ea;
+    border:1px solid #23262e; border-radius:8px; padding:7px 10px; font-size:13px;
+    font-family:inherit; letter-spacing:normal; text-transform:none; }
+  .ef-grid .req { color:#d0a24a; }
+  .ef-tools { display:flex; flex-direction:column; gap:8px; margin-bottom:12px; }
+  .ef-toolshead { font-size:11px; letter-spacing:.08em; text-transform:uppercase;
+    color:#6b6f7a; display:flex; align-items:center; gap:8px; }
+  button.tiny { padding:2px 9px; font-size:11px; }
+  .ef-prompt { border:1px solid #23262e; border-radius:8px; background:#0a0b0e;
+    margin-bottom:12px; }
+  .ef-prompt > summary { cursor:pointer; padding:9px 12px; font-size:12px; color:#9aa0ad;
+    list-style:none; user-select:none; }
+  .ef-prompt > summary::-webkit-details-marker { display:none; }
+  .ef-prompt > summary::before { content:"\25B8  "; color:#6b6f7a; }
+  .ef-prompt[open] > summary::before { content:"\25BE  "; }
+  .ef-prompt textarea { display:block; width:calc(100% - 24px); margin:0 12px 12px;
+    min-height:220px; resize:vertical; background:#0a0b0e; color:#e2e4ea;
+    border:1px solid #23262e; border-radius:8px; padding:12px;
+    font-family:Georgia,"Times New Roman",serif; font-size:14px; line-height:1.8; }
   .toolchecks { display:flex; gap:4px 10px; flex-wrap:wrap; }
   .toolchecks label { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     font-size:11.5px; color:#8b909b; display:flex; align-items:center; gap:4px;
@@ -273,9 +298,42 @@ PAGE = r"""<!DOCTYPE html>
       </div>
       <div class="ctl-row" id="newexp">
         <span class="ctl-label">New experiment</span>
-        <input id="explabel" placeholder="label, e.g. tools-on-v3">
-        <label class="chk"><input type="checkbox" id="expfresh"> fresh start (reset memory)</label>
-        <button id="expstart">Start experiment</button>
+        <button id="newexpbtn">&#65291; Create experiment&hellip;</button>
+        <span class="pstatus">configure the label, prompt, model, and tools in one place</span>
+      </div>
+      <div id="expform" class="expform" style="display:none">
+        <div class="ef-grid">
+          <label>Label <span class="req">*</span>
+            <input id="ef-label" placeholder="e.g. memory-only-v1"></label>
+          <label>Model
+            <select id="ef-model"></select></label>
+          <label class="wide">Description
+            <input id="ef-desc" placeholder="what changes in this experiment (shown on the public lab)"></label>
+          <label class="wide">Goal
+            <input id="ef-goal" placeholder="what you want to learn (optional)"></label>
+          <label class="wide">Hypothesis
+            <input id="ef-hyp" placeholder="what you expect to happen (optional)"></label>
+        </div>
+        <div class="ef-tools">
+          <span class="ef-toolshead">Tools offered to Hannah
+            <button id="ef-tools-all" class="ghost tiny">all</button>
+            <button id="ef-tools-none" class="ghost tiny">none</button>
+          </span>
+          <span id="ef-tools" class="toolchecks"></span>
+          <span class="pstatus" id="ef-tools-hint"></span>
+        </div>
+        <details class="ef-prompt">
+          <summary>System prompt for this experiment (leave as-is or edit)</summary>
+          <textarea id="ef-prompt" spellcheck="false" placeholder="loading current prompt…"></textarea>
+        </details>
+        <div class="ctl-row">
+          <label class="chk"><input type="checkbox" id="ef-fresh" checked> fresh start (reset rolling memory)</label>
+        </div>
+        <div class="ctl-row">
+          <button id="ef-start">Start experiment</button>
+          <button id="ef-cancel" class="ghost">Cancel</button>
+          <span id="ef-status" class="pstatus"></span>
+        </div>
       </div>
       <div class="ctl-row" id="toolsrow">
         <span class="ctl-label">Tools</span>
@@ -517,14 +575,83 @@ async function postJSON(url, body) {
 document.getElementById('dstart').onclick = function(){ postJSON('/api/daemon',{action:'start'}).then(refreshExperiment); };
 document.getElementById('dstop').onclick = function(){ postJSON('/api/daemon',{action:'stop'}).then(refreshExperiment); };
 document.getElementById('drestart').onclick = function(){ postJSON('/api/daemon',{action:'restart'}).then(refreshExperiment); };
-document.getElementById('expstart').onclick = async function(){
-  const label = document.getElementById('explabel').value.trim();
-  if (!label) { alert('Enter a label for the experiment.'); return; }
-  const fresh = document.getElementById('expfresh').checked;
-  const d = await postJSON('/api/experiment/start', {label:label, fresh:fresh});
-  if (!d.ok) alert('Could not start: ' + (d.error||'failed'));
-  document.getElementById('explabel').value = '';
+// --- create-experiment form: label + meta + model + tools + prompt in one place ---
+function efToolLabels() { return document.querySelectorAll('#ef-tools label'); }
+function efSetAll(on) {
+  efToolLabels().forEach(function(l){
+    l.querySelector('input').checked = on;
+    l.className = on ? 'on' : '';
+  });
+}
+async function openExpForm() {
+  const form = document.getElementById('expform');
+  form.style.display = 'block';
+  // Prefill from the live state: models, current tool selection, current prompt.
+  try {
+    const r = await fetch('/api/models'); const d = await r.json();
+    document.getElementById('ef-model').innerHTML = (d.models || []).map(function(m){
+      return '<option value="' + m + '"' + (m === d.current ? ' selected' : '') + '>' + m + '</option>';
+    }).join('');
+  } catch (e) {}
+  try {
+    const r = await fetch('/api/tools'); const d = await r.json();
+    const enabled = d.enabled || [];
+    document.getElementById('ef-tools').innerHTML = (d.tools || []).map(function(t){
+      const on = enabled.indexOf(t) >= 0;
+      return '<label class="' + (on ? 'on' : '') + '" title="' + esc(d.descriptions[t] || '') + '">'
+           + '<input type="checkbox" value="' + t + '"' + (on ? ' checked' : '') + '>' + t + '</label>';
+    }).join('');
+    efToolLabels().forEach(function(l){
+      l.querySelector('input').onchange = function(){
+        l.className = this.checked ? 'on' : '';
+        document.getElementById('ef-tools-hint').textContent =
+          document.querySelectorAll('#ef-tools input:checked').length
+            ? '' : 'no tools — pure reflection';
+      };
+    });
+  } catch (e) {}
+  try {
+    const r = await fetch('/api/prompt'); const d = await r.json();
+    document.getElementById('ef-prompt').value = oneSentencePerLine(d.content || "");
+  } catch (e) {}
+  document.getElementById('ef-label').focus();
+}
+document.getElementById('newexpbtn').onclick = openExpForm;
+document.getElementById('ef-cancel').onclick = function(){
+  document.getElementById('expform').style.display = 'none';
+};
+document.getElementById('ef-tools-all').onclick = function(){ efSetAll(true); };
+document.getElementById('ef-tools-none').onclick = function(){ efSetAll(false); };
+document.getElementById('ef-start').onclick = async function(){
+  const label = document.getElementById('ef-label').value.trim();
+  const st = document.getElementById('ef-status');
+  if (!label) { st.textContent = 'a label is required'; return; }
+  const tools = Array.from(document.querySelectorAll('#ef-tools input:checked'))
+                     .map(function(cb){ return cb.value; });
+  const payload = {
+    label: label,
+    description: document.getElementById('ef-desc').value.trim(),
+    goal: document.getElementById('ef-goal').value.trim(),
+    hypothesis: document.getElementById('ef-hyp').value.trim(),
+    model: document.getElementById('ef-model').value,
+    tools: tools,
+    prompt: document.getElementById('ef-prompt').value,
+    fresh: document.getElementById('ef-fresh').checked
+  };
+  this.disabled = true;
+  st.textContent = 'starting… (switching models can take ~30s)';
+  try {
+    const d = await postJSON('/api/experiment/start', payload);
+    if (d.ok) {
+      st.textContent = '\u2713 experiment started';
+      document.getElementById('expform').style.display = 'none';
+      document.getElementById('ef-label').value = '';
+      loadTools(); loadPrompt(); loadModels();
+    } else { st.textContent = 'error: ' + (d.error || 'failed'); }
+  } catch (e) { st.textContent = 'error starting experiment'; }
+  this.disabled = false;
   refreshExperiment();
+  setTimeout(function(){ st.textContent = ''; }, 8000);
 };
 document.getElementById('expstop').onclick = async function(){
   const summarize = document.getElementById('expsum').checked;
@@ -550,6 +677,7 @@ async function refreshExperiment() {
     const activeexp = document.getElementById('activeexp');
     if (active) {
       newexp.style.display = 'none'; activeexp.style.display = 'flex';
+      document.getElementById('expform').style.display = 'none';
       var toolsDesc = !active.tools_enabled ? 'off'
         : ((active.tools_available && active.tools_available.length)
             ? active.tools_available.join(', ') : 'none');
@@ -841,13 +969,28 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"ok": True, "active": hr.daemon_active()})
 
     def _experiment_start(self) -> None:
-        data = self._read_json_body(max_len=2000) or {}
+        """Create + start an experiment: label, public-lab metadata, model,
+        tool selection, and system prompt applied in one step."""
+        data = self._read_json_body(max_len=50000) or {}
         label = (data.get("label") or "").strip()
         if not label:
             self._json({"ok": False, "error": "a label is required"})
             return
+        tools = data.get("tools")
+        if tools is not None and not isinstance(tools, list):
+            tools = None
+        model = (data.get("model") or "").strip() or None
+        prompt = data.get("prompt") if isinstance(data.get("prompt"), str) else None
+        meta = {k: (data.get(k) or "").strip()
+                for k in ("description", "goal", "hypothesis")}
+        meta = {k: v for k, v in meta.items() if v}
+        if meta:
+            meta["status"] = "active"
+        note = (data.get("description") or data.get("note") or "").strip()
         try:
-            run = hr.start_run(label, data.get("note", ""), bool(data.get("fresh")), self.cfg)
+            run = hr.start_run(label, note, bool(data.get("fresh")), self.cfg,
+                               tools=tools, model=model, system_prompt=prompt,
+                               meta=meta or None)
         except RuntimeError as exc:
             self._json({"ok": False, "error": str(exc)})
             return

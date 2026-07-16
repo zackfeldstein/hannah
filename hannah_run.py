@@ -31,6 +31,9 @@ RUNS_DIR = RESEARCH / "runs"
 CURRENT = RESEARCH / "current_run.json"
 INDEX = RESEARCH / "INDEX.md"
 OVERVIEW = RESEARCH / "overview.md"
+# Public-lab experiment registry (description / goal / hypothesis / status),
+# shown on the public site. Creating an experiment can write its metadata here.
+PUBLIC_REGISTRY = hannah.BASE_DIR / "public_lab" / "experiments.json"
 
 
 # --- daemon + git helpers -----------------------------------------------------
@@ -64,6 +67,42 @@ def _git_info():
     return commit, dirty
 
 
+def restart_llama(log=print) -> None:
+    """Reload llama-server so a newly selected model takes effect."""
+    try:
+        subprocess.run(["systemctl", "--user", "restart", "hannah-llama.service"],
+                       capture_output=True, text=True, timeout=90)
+    except (OSError, subprocess.SubprocessError) as exc:
+        log(f"(could not restart llama-server: {exc})")
+
+
+def update_experiment_registry(name: str, meta: dict, log=print) -> None:
+    """Merge experiment metadata into the public lab registry.
+
+    Only known, non-empty fields are written; existing values for other
+    fields are preserved so hand edits survive.
+    """
+    allowed = {k: str(meta[k]).strip() for k in
+               ("description", "goal", "hypothesis", "notes", "status")
+               if meta.get(k) and str(meta[k]).strip()}
+    if not allowed:
+        return
+    try:
+        registry = json.loads(PUBLIC_REGISTRY.read_text())
+    except (OSError, ValueError):
+        registry = {}
+    entry = registry.get(name, {})
+    entry.update(allowed)
+    registry[name] = entry
+    try:
+        PUBLIC_REGISTRY.parent.mkdir(parents=True, exist_ok=True)
+        PUBLIC_REGISTRY.write_text(json.dumps(registry, indent=2) + "\n",
+                                   encoding="utf-8")
+        log(f"Recorded experiment metadata for the public lab ({', '.join(allowed)}).")
+    except OSError as exc:
+        log(f"(could not write experiment registry: {exc})")
+
+
 def _tool_stats(entries) -> dict:
     used, counts = 0, {}
     for e in entries:
@@ -79,23 +118,50 @@ def _tool_stats(entries) -> dict:
 # --- core API (used by both the CLI and the web UI) ---------------------------
 
 def start_run(label: str, note: str = "", fresh: bool = False, cfg=None,
-              tools=None, log=print) -> dict:
-    """Begin an experiment. Ensures the daemon is running; optionally resets memory.
+              tools=None, model=None, system_prompt=None, meta=None,
+              log=print) -> dict:
+    """Begin an experiment, applying its whole configuration in one step.
 
-    tools: optional list of tool names to offer Hannah for this run (a subset
-    of hannah.TOOLS; [] = no tools at all). None keeps the current selection.
+    Ensures the daemon is running; optionally resets memory. All parameters
+    beyond label/note/fresh are optional and None means "keep as-is":
+
+    tools:         list of tool names to offer Hannah for this run (a subset
+                   of hannah.TOOLS; [] = no tools at all)
+    model:         configured model name to switch to (reloads llama-server)
+    system_prompt: replacement system prompt text (archived for provenance)
+    meta:          public-lab registry metadata (description / goal /
+                   hypothesis / notes / status), shown on the public site
     """
     cfg = cfg or hannah.load_config()
     RESEARCH.mkdir(parents=True, exist_ok=True)
     if CURRENT.exists():
         cur = json.loads(CURRENT.read_text())
         raise RuntimeError(f"A run is already active: '{cur['label']}'. Collect it first.")
+
+    if model:
+        if not hannah.set_selected_model(model, cfg):
+            raise RuntimeError(f"Unknown model: {model!r}. Configured: "
+                               f"{', '.join(hannah.list_models(cfg))}")
+        log(f"Model for this run: {model} (reloading llama-server, ~10-30s)…")
+        restart_llama(log)
+
+    if isinstance(system_prompt, str) and system_prompt.strip():
+        if system_prompt.strip() != hannah.load_system_prompt().strip():
+            hannah.SYSTEM_PROMPT_FILE.parent.mkdir(parents=True, exist_ok=True)
+            hannah.SYSTEM_PROMPT_FILE.write_text(system_prompt, encoding="utf-8")
+            hannah.ensure_prompt_archived()
+            log("Updated the system prompt for this run.")
+
     if tools is not None:
         if not hannah.set_enabled_tools(tools, cfg):
             unknown = [t for t in tools if t not in hannah.TOOLS]
             raise RuntimeError(f"Unknown tool(s): {', '.join(unknown)}. "
                                f"Available: {', '.join(hannah.TOOLS)}")
         log(f"Tools for this run: {', '.join(tools) if tools else '(none)'}.")
+
+    if meta:
+        update_experiment_registry(label, meta, log)
+
     if not daemon_active():
         log("Starting daemon…")
         daemon_action("start", log)
@@ -104,14 +170,16 @@ def start_run(label: str, note: str = "", fresh: bool = False, cfg=None,
         log("Reset logs and rolling memory for a clean start.")
     commit, dirty = _git_info()
     now = datetime.now()
+    available = hannah.enabled_tool_names(cfg)
     run = {
         "label": label,
         "note": note,
         "started_at": now.isoformat(timespec="seconds"),
         "started_ts": now.timestamp(),
         "model": hannah.selected_model_name(cfg),
-        "tools_enabled": cfg.get("tools", {}).get("enabled", False),
-        "tools_available": hannah.enabled_tool_names(cfg),
+        "tools_enabled": bool(cfg.get("tools", {}).get("enabled", False)
+                              and available),
+        "tools_available": available,
         "prompt_fingerprint": hannah.prompt_fingerprint(),
         "system_prompt": hannah.load_system_prompt(),
         "task_prompt": hannah.load_task_prompt(),
@@ -226,6 +294,17 @@ def collect_run(summarize: bool = True, local: bool = False, openai_model=None,
     _rebuild_index()
     if summary_text is not None:
         _update_overview(manifest, summary_text, cfg, local, openai_model, log)
+
+    # If the registry marked this experiment active, flip it to complete so the
+    # public lab's status stays truthful.
+    try:
+        registry = json.loads(PUBLIC_REGISTRY.read_text())
+        if registry.get(run["label"], {}).get("status") == "active":
+            registry[run["label"]]["status"] = "complete"
+            PUBLIC_REGISTRY.write_text(json.dumps(registry, indent=2) + "\n",
+                                       encoding="utf-8")
+    except (OSError, ValueError):
+        pass
 
     # Refresh the public lab (sanitized artifacts + static site). Build-only;
     # publishing to a remote host stays an explicit, separate step.
@@ -452,7 +531,12 @@ def _parse_tools(value):
 
 
 def _cli_start(args):
-    start_run(args.label, args.note, args.fresh, tools=_parse_tools(args.tools))
+    meta = {"description": args.description, "goal": args.goal,
+            "hypothesis": args.hypothesis, "status": "active"}
+    start_run(args.label, args.note or args.description, args.fresh,
+              tools=_parse_tools(args.tools), model=args.model,
+              meta=meta if any(v for k, v in meta.items() if k != "status")
+              else None)
     print("Let Hannah run, then:  python3 hannah_run.py collect --summarize")
 
 
@@ -486,6 +570,14 @@ def main() -> None:
                     help="Tools to offer Hannah for this run: a comma-separated "
                     f"subset of {{{','.join(hannah.TOOLS)}}}, 'all', or 'none'. "
                     "Default: keep the current selection.")
+    ps.add_argument("--model", default=None,
+                    help="Switch to this configured model (reloads llama-server).")
+    ps.add_argument("--description", default="",
+                    help="Experiment description for the public lab registry.")
+    ps.add_argument("--goal", default="",
+                    help="Experiment goal for the public lab registry.")
+    ps.add_argument("--hypothesis", default="",
+                    help="Experiment hypothesis for the public lab registry.")
     sub.add_parser("status", help="Show the active run.")
     pc = sub.add_parser("collect", help="End the run, package it, refresh index/overview.")
     pc.add_argument("--summarize", action="store_true")
