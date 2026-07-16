@@ -713,7 +713,7 @@ async function loadRuns() {
     el.innerHTML = runs.map(function(m){
       var meta = (m.started_at||'') + ' \u00b7 ' + (m.duration||'') + ' \u00b7 ' + (m.model||'')
                + ' \u00b7 tools ' + (m.tools_enabled?'on':'off') + ' \u00b7 ' + (m.entries||0) + ' entries';
-      return '<details class="exp-item" data-folder="' + esc(m.folder) + '">'
+      return '<details class="exp-item" data-folder="' + esc(m.folder) + '" data-label="' + esc(m.label) + '">'
            + '<summary>' + esc(m.label) + '</summary>'
            + '<div class="exp-meta">' + esc(meta) + '</div>'
            + '<div class="exp-body">loading…</div></details>';
@@ -798,7 +798,8 @@ async function showRun(d) {
     +   '<textarea class="noteText" placeholder="paste a custom summary…"></textarea>'
     +   '<button class="noteSave">Add summary</button><span class="noteStatus mono"></span></div>'
     + '</details>'
-    + '<div class="exp-actions"><button class="delRun danger">Delete experiment</button>'
+    + '<div class="exp-actions"><button class="delRun danger">Delete run</button>'
+    +   '<button class="delExp danger">Delete experiment (all runs)</button>'
     +   '<span class="delStatus mono"></span></div>';
   try {
     const r = await fetch('/api/run?folder=' + encodeURIComponent(folder));
@@ -810,9 +811,12 @@ async function showRun(d) {
   body.querySelector('.cpJournal').onclick = function(){ copyRaw(folder, 'journal', body); };
   body.querySelector('.noteSave').onclick = function(){ saveNote(folder, body); };
   body.querySelector('.delRun').onclick = function(){ deleteRun(folder, d, body); };
+  body.querySelector('.delExp').onclick = function(){
+    deleteExperiment(d.getAttribute('data-label') || folder, d, body);
+  };
 }
 async function deleteRun(folder, det, body) {
-  if (!confirm('Delete experiment "' + folder + '"? This permanently removes its folder.')) return;
+  if (!confirm('Delete run "' + folder + '"? This permanently removes its folder.')) return;
   const st = body.querySelector('.delStatus'); st.textContent = 'deleting…';
   try {
     const r = await fetch('/api/run/delete', {method:'POST', headers:{'Content-Type':'application/json'},
@@ -821,6 +825,21 @@ async function deleteRun(folder, det, body) {
     if (d.ok) { det.remove(); loadRuns(); }
     else { st.textContent = 'error: ' + (d.error || 'failed'); }
   } catch (e) { st.textContent = 'error deleting'; }
+}
+async function deleteExperiment(name, det, body) {
+  const typed = prompt('Delete experiment "' + name + '" — ALL of its runs and its '
+    + 'public-lab entry will be permanently removed.\n\nType the experiment name to confirm:');
+  if (typed === null) return;
+  const st = body.querySelector('.delStatus');
+  if (typed.trim() !== name) { st.textContent = 'name did not match — not deleted'; return; }
+  st.textContent = 'deleting experiment…';
+  try {
+    const d = await postJSON('/api/experiment/delete', {name: name});
+    if (d.ok) {
+      st.textContent = '\u2713 deleted ' + (d.deleted_runs || []).length + ' run(s)';
+      loadRuns();
+    } else { st.textContent = 'error: ' + (d.error || 'failed'); }
+  } catch (e) { st.textContent = 'error deleting experiment'; }
 }
 document.getElementById('expbox').addEventListener('toggle', function(){ if (this.open) loadRuns(); });
 
@@ -939,9 +958,17 @@ class Handler(BaseHTTPRequestHandler):
         elif route.path == "/api/run/delete":
             folder = (self._read_json_body(max_len=500) or {}).get("folder", "").strip()
             if not folder or not hr.delete_run(folder):
-                self._json({"ok": False, "error": "could not delete experiment"})
+                self._json({"ok": False, "error": "could not delete run"})
             else:
                 self._json({"ok": True})
+        elif route.path == "/api/experiment/delete":
+            name = (self._read_json_body(max_len=500) or {}).get("name", "").strip()
+            try:
+                result = hr.delete_experiment(name)
+            except RuntimeError as exc:
+                self._json({"ok": False, "error": str(exc)})
+                return
+            self._json({"ok": True, **result})
         else:
             self._send(404, b"not found", "text/plain; charset=utf-8")
 

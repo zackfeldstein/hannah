@@ -10,7 +10,10 @@ The lab layer wraps the existing Hannah runtime without touching it. Flow:
        artifacts into research/runs/<label>/public/, and renders the static
        site into public_lab/site/.
     3. `check` runs the fail-closed sanitizer gate over the rendered site.
-    4. `preview` serves the site locally.
+    4. `preview` serves the site locally as a live control surface: from the
+       Experiments page you can create, delete, and collect experiments (the
+       controls talk to a small local /api/lab/* API that only exists while
+       preview is running).
     5. `publish` re-builds, re-checks, then pushes outbound to S3
        (aws s3 sync). Nothing ever reaches inbound into this machine.
 
@@ -32,9 +35,13 @@ import json
 import os
 import subprocess
 import sys
-from pathlib import Path
+import threading
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
 
 import hannah
+import hannah_run as hr
 from lab import artifacts, rundata, site, state as labstate
 from lab.sanitizer import make_sanitizer
 
@@ -129,18 +136,170 @@ def check(cfg=None, log=print) -> bool:
     return True
 
 
-# --- preview -----------------------------------------------------------------------
+# --- preview (control-capable local server) ----------------------------------------
+# When you preview the lab on your own machine it is a live control surface, not
+# just a static file server: the experiments page can create, delete, and
+# collect experiments through the small /api/lab/* API below. Those endpoints
+# only exist while `preview` is running - the rendered HTML detects them at
+# runtime, so if you ever serve public_lab/site/ from a plain static host the
+# controls simply never appear and the site stays read-only.
+
+# Background collect (summary generation is slow), polled by the UI.
+_collect = {"running": False, "log": [], "done": False, "error": None, "result": None}
+
+
+def _collect_worker(cfg):
+    _collect.update(running=True, done=False, error=None, result=None, log=[])
+
+    def log(msg):
+        _collect["log"].append(str(msg))
+
+    try:
+        _collect["result"] = hr.collect_run(summarize=True, cfg=cfg, log=log)
+    except Exception as exc:  # surface to the UI rather than crashing the server
+        _collect["error"] = str(exc)
+        log(f"ERROR: {exc}")
+    finally:
+        _collect.update(running=False, done=True)
+
+
+class LabControlHandler(SimpleHTTPRequestHandler):
+    """Serves public_lab/site/ and a small experiment-control API."""
+
+    cfg = None  # set on the class before serving
+
+    def _json(self, obj, code=200):
+        body = json.dumps(obj).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _read_json(self, max_len=100000):
+        try:
+            n = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            return None
+        if n <= 0 or n > max_len:
+            return {}
+        try:
+            return json.loads(self.rfile.read(n).decode("utf-8"))
+        except ValueError:
+            return None
+
+    # -- routing --
+    def do_GET(self):  # noqa: N802
+        if urlparse(self.path).path == "/api/lab/options":
+            return self._options()
+        return super().do_GET()
+
+    def do_POST(self):  # noqa: N802
+        path = urlparse(self.path).path
+        if path == "/api/lab/experiment/create":
+            return self._create()
+        if path == "/api/lab/experiment/delete":
+            return self._delete()
+        if path == "/api/lab/experiment/collect":
+            return self._collect_start()
+        self._json({"ok": False, "error": "not found"}, 404)
+
+    # -- endpoints --
+    def _options(self):
+        cfg = self.cfg
+        self._json({
+            "control": True,
+            "models": list(hannah.list_models(cfg).keys()),
+            "current_model": hannah.selected_model_name(cfg),
+            "tools": list(hannah.TOOLS),
+            "tool_descriptions": {n: s["description"]
+                                  for n, s in hannah.TOOLS.items()},
+            "enabled_tools": hannah.enabled_tool_names(cfg),
+            "current_prompt": hannah.load_system_prompt(),
+            "daemon_active": hr.daemon_active(),
+            "active": hr.active_run(cfg),
+            "collecting": {"running": _collect["running"],
+                           "done": _collect["done"],
+                           "error": _collect["error"],
+                           "log": _collect["log"][-12:]},
+        })
+
+    def _create(self):
+        data = self._read_json() or {}
+        label = (data.get("label") or "").strip()
+        if not label:
+            self._json({"ok": False, "error": "a label is required"})
+            return
+        tools = data.get("tools")
+        if tools is not None and not isinstance(tools, list):
+            tools = None
+        model = (data.get("model") or "").strip() or None
+        prompt = data.get("prompt") if isinstance(data.get("prompt"), str) else None
+        meta = {k: (data.get(k) or "").strip()
+                for k in ("description", "goal", "hypothesis")}
+        meta = {k: v for k, v in meta.items() if v}
+        meta["status"] = "active"
+        try:
+            hr.start_run(label, meta.get("description", ""),
+                         bool(data.get("fresh")), self.cfg, tools=tools,
+                         model=model, system_prompt=prompt, meta=meta,
+                         log=lambda *a, **k: None)
+        except RuntimeError as exc:
+            self._json({"ok": False, "error": str(exc)})
+            return
+        # Rebuild so the new (registry-only, run-less) experiment shows at once.
+        try:
+            build(self.cfg, log=lambda *a, **k: None)
+        except Exception:
+            pass
+        self._json({"ok": True})
+
+    def _delete(self):
+        name = (self._read_json(max_len=1000) or {}).get("name", "").strip()
+        try:
+            result = hr.delete_experiment(name, log=lambda *a, **k: None)
+        except RuntimeError as exc:
+            self._json({"ok": False, "error": str(exc)})
+            return
+        self._json({"ok": True, **result})
+
+    def _collect_start(self):
+        if _collect["running"]:
+            self._json({"ok": False, "error": "a collection is already running"})
+            return
+        if not hr.CURRENT.exists():
+            self._json({"ok": False, "error": "no active experiment to collect"})
+            return
+        threading.Thread(target=_collect_worker, args=(self.cfg,),
+                         daemon=True).start()
+        self._json({"ok": True, "started": True})
+
+    def log_message(self, *args):  # keep the console quiet
+        pass
+
 
 def preview(port: int, host: str = "0.0.0.0") -> None:
-    """Serve the built site. The content is public-safe by construction, so the
-    default binds to all interfaces (reachable on your LAN); pass
-    --host 127.0.0.1 for a local-only preview."""
+    """Serve the built lab locally as a live control surface.
+
+    Binds all interfaces by default (reachable on your LAN); pass
+    --host 127.0.0.1 for local-only. The create/delete/collect controls act on
+    your local runtime, so keep this on a trusted network.
+    """
     if not SITE_DIR.exists():
         raise SystemExit("Build the site first: python3 hannah_lab.py build")
+    LabControlHandler.cfg = hannah.load_config()
+    handler = partial(LabControlHandler, directory=str(SITE_DIR))
+    server = ThreadingHTTPServer((host, port), handler)
     shown = _lan_ip() if host == "0.0.0.0" else host
     print(f"Serving {SITE_DIR} at http://{shown}:{port}/ (Ctrl-C to stop)")
-    subprocess.run([sys.executable, "-m", "http.server", str(port),
-                    "--bind", host, "-d", str(SITE_DIR)])
+    print("Live control enabled: create, delete, and collect experiments from "
+          "the Experiments page.")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopping preview.")
+    finally:
+        server.server_close()
 
 
 def _lan_ip() -> str:

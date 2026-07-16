@@ -370,9 +370,30 @@ def render_experiments_list(groups, registry, github):
 conditions — prompt, senses, tools, model — and the runs collected under it.
 Open one to see its runs, journal, memory, beliefs, questions, and
 failures.</p></div>"""]
+
+    # Control panel — hidden until the local control API confirms it is live
+    # (i.e. you are running `hannah_lab.py preview`). On a plain static host
+    # these controls never appear and the page stays read-only.
+    body.append(_EXP_CONTROLS_HTML)
+
     ordered = sorted(groups, key=lambda g: g["runs"][-1].manifest.get(
         "started_at") or "", reverse=True)
+    group_names = {g["name"] for g in groups}
+    # Registry experiments with no collected runs yet (e.g. just created, or
+    # currently running) show as "pending" tiles so creating one feels live.
+    pending = [(name, meta) for name, meta in registry.items()
+               if name not in group_names]
+
     body.append('<div class="tiles">')
+    for name, meta in sorted(pending, key=lambda x: x[0].lower()):
+        status = _status_chip(meta.get("status", "pending") or "pending")
+        desc = _truncate(meta.get("description", ""), 150)
+        body.append(f"""<div class="tile pending" data-exp="{esc(name)}">
+<div class="tile-head"><span class="tile-name">{esc(name)}</span>{status}</div>
+<p class="tile-desc">{esc(desc)}</p>
+<div class="tile-meta"><span>awaiting first run</span></div>
+<button class="tile-del" data-exp="{esc(name)}" title="Delete experiment"
+  style="display:none">✕</button></div>""")
     for g in ordered:
         name, slug, runs = g["name"], g["slug"], g["runs"]
         meta = registry.get(name, {})
@@ -380,20 +401,264 @@ failures.</p></div>"""]
         status = (_status_chip(meta["status"]) if meta.get("status") else "")
         desc = _truncate(meta.get("description", "")
                          or latest.manifest.get("note", ""), 150)
-        body.append(f"""<a class="tile" href="experiments/{slug}/index.html">
+        body.append(f"""<div class="tile" data-exp="{esc(name)}">
+<a class="tile-open" href="experiments/{slug}/index.html">
 <div class="tile-head"><span class="tile-name">{esc(name)}</span>{status}</div>
 <p class="tile-desc">{esc(desc)}</p>
 <div class="tile-meta">
 <span>{len(runs)} run{"s" if len(runs) != 1 else ""}</span>
 <span>{sum(len(r.entries) for r in runs)} entries</span>
 <span>last run {_fmt_date(latest.manifest.get('ended_at'))}</span>
-</div></a>""")
+</div></a>
+<button class="tile-del" data-exp="{esc(name)}" title="Delete experiment"
+  style="display:none">✕</button></div>""")
     body.append("</div>")
-    if not groups:
-        body.append("<p class='muted'>No experiments collected yet.</p>")
+    if not groups and not pending:
+        body.append('<p class="muted" id="noexp">No experiments yet. Start one '
+                    "with the button above, or "
+                    "<span class='mono'>python3 hannah_run.py start</span>.</p>")
+    body.append(_EXP_CONTROLS_SCRIPT)
     return _page("Experiments", "\n".join(body), github=github,
                  active="experiments",
                  crumbs=[("Experiments", None)])
+
+
+# The create/delete/collect control panel injected into experiments.html.
+# It is inert markup + scoped CSS; the script below only activates it when the
+# local preview control API answers, so a published static site is unaffected.
+_EXP_CONTROLS_HTML = """
+<style>
+.labctl { margin:0 0 22px; }
+.labctl-bar { display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+.labctl .btn-primary { background:var(--accent); color:#fff; border:none;
+  border-radius:8px; padding:8px 16px; font-size:13px; font-weight:600;
+  cursor:pointer; }
+.labctl .btn-primary:hover { filter:brightness(1.08); }
+.labctl .btn-primary:disabled { opacity:.5; cursor:default; }
+.active-box { font-size:13px; color:var(--body); background:var(--panel);
+  border:1px solid var(--border); border-radius:8px; padding:8px 12px; }
+.active-box button, .expform button.danger, #labmsg + * button.danger {
+  margin-left:8px; }
+button.danger { background:var(--red-soft); color:var(--red);
+  border:1px solid #eec7c9; border-radius:7px; padding:5px 11px; font-size:12px;
+  cursor:pointer; }
+button.danger:hover { filter:brightness(1.04); }
+.labmsg { font-size:12.5px; color:var(--muted); margin-top:8px; min-height:1em; }
+.expform { border:1px solid var(--border); border-radius:12px;
+  background:var(--panel); padding:18px 20px; margin-top:14px; }
+.expform .ef-grid { display:grid; grid-template-columns:1fr 1fr; gap:12px 16px; }
+.expform label.field { display:flex; flex-direction:column; gap:5px;
+  font-size:10.5px; letter-spacing:.08em; text-transform:uppercase;
+  color:var(--dim); }
+.expform label.field.wide { grid-column:1 / -1; }
+.expform input[type=text], .expform select, .expform textarea {
+  background:#fff; color:var(--text); border:1px solid var(--border);
+  border-radius:8px; padding:8px 10px; font-size:13px; font-family:inherit;
+  letter-spacing:normal; text-transform:none; }
+.expform textarea { min-height:200px; resize:vertical;
+  font-family:Georgia,"Times New Roman",serif; font-size:14px; line-height:1.7; }
+.ef-toolsrow { grid-column:1 / -1; }
+.ef-toolshead { display:flex; align-items:center; gap:8px; margin-bottom:6px;
+  font-size:10.5px; letter-spacing:.08em; text-transform:uppercase;
+  color:var(--dim); }
+.ef-toolshead button { padding:2px 9px; font-size:11px; border-radius:20px;
+  border:1px solid var(--border); background:#fff; color:var(--muted);
+  cursor:pointer; }
+.toolchecks { display:flex; gap:6px 8px; flex-wrap:wrap; }
+.toolchecks label { display:flex; align-items:center; gap:5px; cursor:pointer;
+  font-family:ui-monospace,Menlo,monospace; font-size:11.5px; color:var(--muted);
+  background:#fff; border:1px solid var(--border); border-radius:16px;
+  padding:3px 11px; user-select:none; }
+.toolchecks label.on { color:#0b6b3d; background:var(--accent-soft);
+  border-color:#bfe3cf; }
+.ef-actions { display:flex; align-items:center; gap:10px; margin-top:14px; }
+.ef-actions .btn-primary { background:var(--accent); color:#fff; border:none;
+  border-radius:8px; padding:8px 16px; font-size:13px; font-weight:600;
+  cursor:pointer; }
+.ef-actions .ghost { background:#fff; color:var(--muted);
+  border:1px solid var(--border); border-radius:8px; padding:8px 14px;
+  font-size:13px; cursor:pointer; }
+.ef-status { font-size:12.5px; color:var(--muted); }
+.ef-chk { display:flex; align-items:center; gap:6px; font-size:12.5px;
+  color:var(--body); text-transform:none; letter-spacing:normal; }
+.tile { position:relative; }
+.tile-open { display:block; text-decoration:none; color:inherit; }
+.tile.pending { opacity:.85; border-style:dashed; }
+.tile-del { position:absolute; top:10px; right:10px; width:24px; height:24px;
+  border-radius:50%; border:1px solid var(--border); background:#fff;
+  color:var(--red); font-size:12px; line-height:1; cursor:pointer; padding:0; }
+.tile-del:hover { background:var(--red-soft); border-color:#eec7c9; }
+</style>
+<div class="labctl" id="labctl" style="display:none">
+  <div class="labctl-bar">
+    <button class="btn-primary" id="newExpBtn">＋ New experiment</button>
+    <span class="active-box" id="activeBox" style="display:none"></span>
+  </div>
+  <div class="expform" id="expForm" style="display:none">
+    <div class="ef-grid">
+      <label class="field">Label
+        <input type="text" id="ef-label" placeholder="e.g. memory-only-v1"></label>
+      <label class="field">Model
+        <select id="ef-model"></select></label>
+      <label class="field wide">Description
+        <input type="text" id="ef-desc"
+          placeholder="what changes in this experiment"></label>
+      <label class="field wide">Goal
+        <input type="text" id="ef-goal"
+          placeholder="what you want to learn (optional)"></label>
+      <label class="field wide">Hypothesis
+        <input type="text" id="ef-hyp"
+          placeholder="what you expect to happen (optional)"></label>
+      <div class="ef-toolsrow">
+        <div class="ef-toolshead">Tools offered to Hannah
+          <button type="button" id="ef-tools-all">all</button>
+          <button type="button" id="ef-tools-none">none</button></div>
+        <div class="toolchecks" id="ef-tools"></div>
+      </div>
+      <label class="field wide">System prompt
+        <textarea id="ef-prompt" spellcheck="false"></textarea></label>
+    </div>
+    <div class="ef-actions">
+      <label class="ef-chk"><input type="checkbox" id="ef-fresh" checked>
+        fresh start (reset rolling memory)</label>
+      <button class="btn-primary" id="ef-start">Start experiment</button>
+      <button class="ghost" id="ef-cancel">Cancel</button>
+      <span class="ef-status" id="ef-status"></span>
+    </div>
+  </div>
+  <div class="labmsg" id="labmsg"></div>
+</div>"""
+
+
+_EXP_CONTROLS_SCRIPT = """
+<script>
+(function(){
+  var API = '/api/lab';
+  var ctl = document.getElementById('labctl');
+  var msg = document.getElementById('labmsg');
+  function show(el, on){ if (el) el.style.display = on ? '' : 'none'; }
+  function esc(s){ return (s==null?'':String(s)).replace(/[&<>"]/g,
+    function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
+  function val(id){ return (document.getElementById(id).value||'').trim(); }
+
+  fetch(API + '/options').then(function(r){ if(!r.ok) throw 0; return r.json(); })
+    .then(function(o){ if (o && o.control){ show(ctl, true); init(o); } })
+    .catch(function(){ /* static host: controls stay hidden, page read-only */ });
+
+  function init(o){
+    var msel = document.getElementById('ef-model');
+    msel.innerHTML = (o.models||[]).map(function(m){
+      return '<option'+(m===o.current_model?' selected':'')+'>'+esc(m)+'</option>';
+    }).join('');
+    var tbox = document.getElementById('ef-tools');
+    tbox.innerHTML = (o.tools||[]).map(function(t){
+      var on = (o.enabled_tools||[]).indexOf(t) >= 0;
+      return '<label class="'+(on?'on':'')+'" title="'+esc(o.tool_descriptions[t]||'')+'">'
+        + '<input type="checkbox" value="'+esc(t)+'"'+(on?' checked':'')+'>'+esc(t)+'</label>';
+    }).join('');
+    tbox.querySelectorAll('input').forEach(function(cb){
+      cb.onchange = function(){ cb.parentNode.className = cb.checked?'on':''; }; });
+    document.getElementById('ef-prompt').value = o.current_prompt || '';
+    document.querySelectorAll('.tile-del').forEach(function(b){
+      show(b, true);
+      b.onclick = function(e){ e.preventDefault(); e.stopPropagation();
+        delExp(b.getAttribute('data-exp')); };
+    });
+    updateActive(o);
+  }
+
+  function setAll(on){
+    document.querySelectorAll('#ef-tools input').forEach(function(cb){
+      cb.checked = on; cb.parentNode.className = on?'on':''; }); }
+  document.getElementById('ef-tools-all').onclick = function(){ setAll(true); };
+  document.getElementById('ef-tools-none').onclick = function(){ setAll(false); };
+  document.getElementById('newExpBtn').onclick = function(){
+    var f = document.getElementById('expForm');
+    show(f, f.style.display === 'none');
+    if (f.style.display !== 'none') document.getElementById('ef-label').focus();
+  };
+  document.getElementById('ef-cancel').onclick = function(){
+    show(document.getElementById('expForm'), false); };
+
+  document.getElementById('ef-start').onclick = function(){
+    var label = val('ef-label');
+    var st = document.getElementById('ef-status');
+    if (!label){ st.textContent = 'a label is required'; return; }
+    var tools = [].map.call(
+      document.querySelectorAll('#ef-tools input:checked'),
+      function(cb){ return cb.value; });
+    var payload = { label: label, description: val('ef-desc'), goal: val('ef-goal'),
+      hypothesis: val('ef-hyp'), model: document.getElementById('ef-model').value,
+      tools: tools, prompt: document.getElementById('ef-prompt').value,
+      fresh: document.getElementById('ef-fresh').checked };
+    var btn = this; btn.disabled = true;
+    st.textContent = 'starting… (switching models can take ~30s)';
+    post('/experiment/create', payload).then(function(d){
+      if (d.ok){ st.textContent = '✓ started — reloading'; location.reload(); }
+      else { st.textContent = 'error: ' + (d.error||'failed'); btn.disabled = false; }
+    }).catch(function(){ st.textContent = 'error starting'; btn.disabled = false; });
+  };
+
+  function delExp(name){
+    var typed = window.prompt('Delete experiment "'+name+'" and ALL of its runs?\\n'
+      + 'This is permanent. Type the experiment name to confirm:');
+    if (typed === null) return;
+    if (typed.trim() !== name){ msg.textContent = 'name did not match — not deleted'; return; }
+    msg.textContent = 'deleting…';
+    post('/experiment/delete', {name: name}).then(function(d){
+      if (d.ok){ location.reload(); }
+      else { msg.textContent = 'error: ' + (d.error||'failed'); }
+    }).catch(function(){ msg.textContent = 'error deleting'; });
+  }
+
+  function collect(){
+    if (!window.confirm('Stop the active experiment and collect it? This '
+      + 'packages the run, writes a summary, and resets rolling memory.')) return;
+    msg.textContent = 'collecting…';
+    post('/experiment/collect', {}).then(function(d){
+      if (d.ok){ poll(); } else { msg.textContent = 'error: ' + (d.error||'failed'); }
+    });
+  }
+
+  function updateActive(o){
+    var box = document.getElementById('activeBox');
+    var newBtn = document.getElementById('newExpBtn');
+    var col = o.collecting || {};
+    if (col.running){
+      show(box, true); newBtn.disabled = true;
+      box.textContent = 'Collecting… ' + ((col.log && col.log.length)
+        ? col.log[col.log.length-1] : 'working');
+      setTimeout(poll, 1500); return;
+    }
+    if (o.active){
+      show(box, true); newBtn.disabled = true;
+      var tools = (o.active.tools_available && o.active.tools_available.length)
+        ? o.active.tools_available.join(', ') : 'none';
+      box.innerHTML = 'Active: <b>'+esc(o.active.label)+'</b> · '
+        + esc(o.active.elapsed) + ' · ' + o.active.entries_so_far
+        + ' entries · tools: ' + esc(tools)
+        + ' <button class="danger" id="collectBtn">Stop &amp; collect</button>';
+      document.getElementById('collectBtn').onclick = collect;
+    } else { show(box, false); newBtn.disabled = false; }
+  }
+
+  function poll(){
+    fetch(API + '/options').then(function(r){ return r.json(); }).then(function(o){
+      updateActive(o);
+      if (o.collecting && o.collecting.done && !o.collecting.running){
+        msg.textContent = '✓ collected — reloading'; setTimeout(function(){
+          location.reload(); }, 600);
+      }
+    }).catch(function(){});
+  }
+
+  function post(path, payload){
+    return fetch(API + path, { method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload||{}) })
+      .then(function(r){ return r.json(); });
+  }
+})();
+</script>"""
 
 
 # --- experiment pages -----------------------------------------------------------------

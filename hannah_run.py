@@ -411,8 +411,21 @@ def _read_notes(d: Path) -> list:
     return []
 
 
+def _rebuild_lab(cfg=None, log=print) -> None:
+    """Refresh the public lab site so it reflects run/experiment changes."""
+    cfg = cfg or hannah.load_config()
+    if not cfg.get("lab", {}).get("auto_build", True):
+        return
+    try:
+        import hannah_lab
+        hannah_lab.build(cfg, log=lambda *a, **k: None)
+        log("Rebuilt the public lab site.")
+    except Exception as exc:  # lab problems must never break a delete
+        log(f"(public lab rebuild failed: {exc})")
+
+
 def delete_run(folder: str) -> bool:
-    """Permanently remove an experiment folder (guarded to stay inside runs/)."""
+    """Permanently remove one run folder (guarded to stay inside runs/)."""
     d = RUNS_DIR / Path(folder).name
     try:
         resolved = d.resolve()
@@ -422,7 +435,71 @@ def delete_run(folder: str) -> bool:
     except OSError:
         return False
     _rebuild_index()
+    _rebuild_lab()
     return True
+
+
+def experiment_run_folders(name: str) -> list:
+    """Folder names of every collected run belonging to an experiment label."""
+    folders = []
+    for mf in sorted(RUNS_DIR.glob("*/manifest.json")):
+        try:
+            if json.loads(mf.read_text()).get("label") == name:
+                folders.append(mf.parent.name)
+        except (OSError, ValueError):
+            continue
+    return folders
+
+
+def delete_experiment(name: str, log=print) -> dict:
+    """Delete an entire experiment: all its run folders + its registry entry.
+
+    Refuses while the experiment is actively running (collect it first).
+    Returns {"deleted_runs": [...], "registry_removed": bool}.
+    """
+    name = (name or "").strip()
+    if not name:
+        raise RuntimeError("an experiment name is required")
+    if CURRENT.exists():
+        try:
+            cur = json.loads(CURRENT.read_text())
+        except (OSError, ValueError):
+            cur = {}
+        if cur.get("label") == name:
+            raise RuntimeError(f"'{name}' is the active experiment - stop & "
+                               "collect (or discard) it before deleting")
+
+    folders = experiment_run_folders(name)
+    deleted = []
+    for folder in folders:
+        d = RUNS_DIR / Path(folder).name
+        try:
+            resolved = d.resolve()
+            if resolved.parent == RUNS_DIR.resolve() and resolved.is_dir():
+                shutil.rmtree(resolved)
+                deleted.append(folder)
+        except OSError as exc:
+            log(f"(could not delete run {folder}: {exc})")
+
+    registry_removed = False
+    try:
+        registry = json.loads(PUBLIC_REGISTRY.read_text())
+        if name in registry:
+            del registry[name]
+            PUBLIC_REGISTRY.write_text(json.dumps(registry, indent=2) + "\n",
+                                       encoding="utf-8")
+            registry_removed = True
+    except (OSError, ValueError):
+        pass
+
+    if not deleted and not registry_removed:
+        raise RuntimeError(f"unknown experiment: {name!r}")
+
+    _rebuild_index()
+    _rebuild_lab(log=log)
+    log(f"Deleted experiment '{name}': {len(deleted)} run(s)"
+        f"{', registry entry removed' if registry_removed else ''}.")
+    return {"deleted_runs": deleted, "registry_removed": registry_removed}
 
 
 def add_note(folder: str, label: str, text: str) -> list:
@@ -559,6 +636,22 @@ def _cli_collect(args):
                 keep_memory=args.keep_memory, restart=not args.no_restart)
 
 
+def _cli_delete(args):
+    if args.run:
+        if delete_run(args.run):
+            print(f"Deleted run folder '{args.run}'.")
+        else:
+            raise SystemExit(f"Could not delete run folder: {args.run!r}")
+        return
+    folders = experiment_run_folders(args.experiment)
+    if folders and not args.yes:
+        print(f"This will permanently delete experiment '{args.experiment}' "
+              f"and its {len(folders)} run(s): {', '.join(folders)}")
+        if input("Type the experiment name to confirm: ").strip() != args.experiment:
+            raise SystemExit("Aborted.")
+    delete_experiment(args.experiment)
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="Hannah experiment runner (start/status/collect).")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -585,8 +678,14 @@ def main() -> None:
     pc.add_argument("--openai-model")
     pc.add_argument("--keep-memory", action="store_true")
     pc.add_argument("--no-restart", action="store_true")
+    pd = sub.add_parser("delete", help="Delete an experiment (all runs + registry) or one run folder.")
+    group = pd.add_mutually_exclusive_group(required=True)
+    group.add_argument("--experiment", help="Experiment name: delete ALL its runs + registry entry.")
+    group.add_argument("--run", help="Delete a single run folder under research/runs/.")
+    pd.add_argument("--yes", action="store_true", help="Skip the confirmation prompt.")
     args = p.parse_args()
-    {"start": _cli_start, "status": _cli_status, "collect": _cli_collect}[args.cmd](args)
+    {"start": _cli_start, "status": _cli_status, "collect": _cli_collect,
+     "delete": _cli_delete}[args.cmd](args)
 
 
 if __name__ == "__main__":

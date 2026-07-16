@@ -178,7 +178,10 @@ directly.
   the cross-run overview, rebuilds the public lab, and restarts the daemon —
   in the background with live progress.
 - **Experiments browser** — the evolving cross-run `overview.md` and every
-  collected run with its summary; attach your own notes/analyses to any run.
+  collected run with its summary; attach your own notes/analyses to any run,
+  delete a single run, or **delete a whole experiment** (all its runs plus its
+  public-lab entry — confirmed by typing the experiment name, and refused
+  while that experiment is running).
 
 Start it (installed as a user service alongside the daemon — see
 [Running continuously](#running-continuously-daemon)):
@@ -322,6 +325,10 @@ python3 hannah_run.py status
 
 # End it: package everything since start, summarize, and start fresh.
 python3 hannah_run.py collect --summarize
+
+# Delete a whole experiment (all runs + public-lab entry) or one run folder.
+python3 hannah_run.py delete --experiment memory-only
+python3 hannah_run.py delete --run memory-only_231502
 ```
 
 `collect` does the whole cleanup: it stops the daemon, writes everything since
@@ -431,6 +438,16 @@ python3 hannah_lab.py check      # re-run the fail-closed sanitizer gate
 
 `build` also runs automatically after every `hannah_run.py collect` (disable
 with `config.json → lab.auto_build`).
+
+**Preview is a live control surface.** When you run `preview` on your own
+machine, the Experiments page can **create, delete, and stop-&-collect
+experiments** directly — the create form sets label, description/goal/
+hypothesis, model, tools, and prompt, exactly like the private control UI.
+These controls talk to a small `/api/lab/*` API that only exists while
+`preview` is running: they act on your local runtime, so keep preview on a
+trusted network (`--host 127.0.0.1` for local-only). The controls detect that
+API at runtime, so if you ever serve `public_lab/site/` from a plain static
+host instead, they simply don't appear and the site stays read-only.
 
 ### How the site is organized
 
