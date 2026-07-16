@@ -109,8 +109,10 @@ directly.
 - **Journal feed** — her entries newest-first, each stamped with an absolute
   date/time, a relative "2m ago" label, and **the model that wrote it**.
 - **Run experiments** — a **control panel** to **start/stop/restart the daemon**
-  and to **start a new experiment** (a label, optional "fresh start" that resets
-  her memory) and **stop it** — which packages the run, generates the summary, and
+  and a **create-experiment form** that configures everything in one place:
+  label, description/goal/hypothesis (published to the public lab), model,
+  which tools Hannah is offered, an optional system-prompt edit, and a fresh
+  start. **Stop & collect** packages the run, generates the summary, and
   refreshes the index/overview, all in the background with live progress.
 - **Edit her prompt in the browser** — change Hannah's voice and identity in a
   live editor and hit **Save**; it takes effect on her very next entry.
