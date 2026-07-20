@@ -268,9 +268,16 @@ Three systemd **user** services (see `systemd/`):
 
 How the daemon behaves (all tunable in `config.json`):
 
-- **Hybrid cadence** — samples telemetry cheaply every ~20s, but only wakes
-  the agent when something *salient* happens (a login, a temperature/power/
-  load jump, etc.) or on a slow heartbeat, debounced so bursts don't spam.
+- **Experiment-gated** — by default (`daemon.require_active_experiment: true`)
+  the daemon only reflects while an experiment is active (one started from the
+  UI or `hannah_run.py start`). With no experiment it stays running and warm
+  but writes nothing; it resumes the moment you start one, and idles again
+  after you collect. Set the flag to `false` for a classic always-on
+  continuous mind.
+- **Hybrid cadence** — while observing, it samples telemetry cheaply every
+  ~20s but only wakes the agent when something *salient* happens (a login, a
+  temperature/power/load jump, etc.) or on a slow heartbeat, debounced so
+  bursts don't spam.
 - **Tool loop** — each wake-up allows a capped number of tool-call rounds
   before she must write (config `tools.max_calls`).
 - **Rolling memory + themes** — continuity across entries, as described above.
@@ -325,6 +332,10 @@ python3 hannah_run.py status
 
 # End it: package everything since start, summarize, and start fresh.
 python3 hannah_run.py collect --summarize
+
+# Run an existing experiment again, reusing its config (model/tools/prompt).
+python3 hannah_run.py rerun --experiment memory-only               # fresh replicate
+python3 hannah_run.py rerun --experiment memory-only --keep-memory # continue
 
 # Delete a whole experiment (all runs + public-lab entry) or one run folder.
 python3 hannah_run.py delete --experiment memory-only
@@ -443,10 +454,20 @@ with `config.json → lab.auto_build`).
 machine, the Experiments page can **create, delete, and stop-&-collect
 experiments** directly — the create form sets label, description/goal/
 hypothesis, model, tools, and prompt, exactly like the private control UI.
+Each experiment tile has a **↻ Run again** button that starts another run
+under the same label, reusing its model, tools, and prompt — you choose
+**Fresh replicate** (reset memory; an independent trial for reproducibility)
+or **Continue from last run** (restore the previous run's memory and build on
+it). The lab groups runs under one experiment and tracks how beliefs and
+memory evolve across them, so re-running is how the cross-run picture is built.
+
 A running experiment is marked **● live** on its tile and links to a
 **live view** (`live.html`) that streams its journal, tool calls, and counts
 in real time while it runs — so you can watch an experiment unfold before
-collecting it.
+collecting it. The Experiments page also has **daemon controls**
+(start / stop / restart with a live status dot) so you can bring Hannah up or
+down without touching `systemctl` (starting the daemon also pulls up
+llama-server).
 These controls talk to a small `/api/lab/*` API that only exists while
 `preview` is running: they act on your local runtime, so keep preview on a
 trusted network (`--host 127.0.0.1` for local-only). The controls detect that

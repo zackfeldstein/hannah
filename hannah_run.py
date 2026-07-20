@@ -451,6 +451,80 @@ def experiment_run_folders(name: str) -> list:
     return folders
 
 
+def _latest_run_folder(name: str):
+    """Folder name of the most recent collected run of an experiment, or None."""
+    best, best_key = None, ""
+    for folder in experiment_run_folders(name):
+        try:
+            m = json.loads((RUNS_DIR / folder / "manifest.json").read_text())
+        except (OSError, ValueError):
+            continue
+        key = m.get("ended_at") or m.get("started_at") or folder
+        if key >= best_key:
+            best, best_key = folder, key
+    return best
+
+
+def rerun_experiment(name: str, keep_memory: bool = False, cfg=None,
+                     log=print) -> dict:
+    """Start another run of an existing experiment, reusing its configuration.
+
+    Reuses the model, tools, system prompt, and public-lab metadata captured in
+    the experiment's most recent run, and starts the next run under the same
+    label (the lab groups them together and tracks how beliefs/memory evolve
+    across them).
+
+    keep_memory=False (default): an independent replicate under the same
+    conditions, with rolling memory reset. keep_memory=True: continue from the
+    previous run's rolling memory (restored from its bundle).
+    """
+    name = (name or "").strip()
+    if not name:
+        raise RuntimeError("an experiment name is required")
+    cfg = cfg or hannah.load_config()
+    folder = _latest_run_folder(name)
+    if not folder:
+        raise RuntimeError(f"no collected runs found for experiment {name!r} "
+                           "to reuse — start it fresh instead")
+    d = RUNS_DIR / folder
+    try:
+        manifest = json.loads((d / "manifest.json").read_text())
+    except (OSError, ValueError):
+        manifest = {}
+    model = manifest.get("model_at_start")
+    tools = manifest.get("tools_available")  # None for older runs → keep current
+    prompt_file = d / "prompts" / "system_prompt.txt"
+    system_prompt = (prompt_file.read_text(encoding="utf-8")
+                     if prompt_file.exists() else None)
+    try:
+        registry = json.loads(PUBLIC_REGISTRY.read_text())
+    except (OSError, ValueError):
+        registry = {}
+    meta = dict(registry.get(name, {}))
+    meta["status"] = "active"
+
+    if keep_memory:
+        # Restore the previous run's rolling memory so she continues from it
+        # (collect resets logs/memory.jsonl, so the chain lives in the bundle).
+        src = d / "memory.jsonl"
+        if src.exists():
+            try:
+                hannah.LOG_DIR.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, hannah.MEMORY_FILE)
+                log("Restored rolling memory from the previous run.")
+            except OSError as exc:
+                log(f"(could not restore memory: {exc})")
+        else:
+            log("(no saved memory in the previous run bundle; starting clean)")
+
+    start_run(name, meta.get("description", ""), fresh=not keep_memory, cfg=cfg,
+              tools=tools, model=model, system_prompt=system_prompt, meta=meta,
+              log=log)
+    mode = "continuing memory" if keep_memory else "fresh replicate"
+    log(f"Re-running '{name}' ({mode}), reusing config from {folder}.")
+    return {"label": name, "keep_memory": keep_memory, "reused_from": folder}
+
+
 def delete_experiment(name: str, log=print) -> dict:
     """Delete an entire experiment: all its run folders + its registry entry.
 
@@ -636,6 +710,11 @@ def _cli_collect(args):
                 keep_memory=args.keep_memory, restart=not args.no_restart)
 
 
+def _cli_rerun(args):
+    rerun_experiment(args.experiment, keep_memory=args.keep_memory)
+    print("Let it run, then:  python3 hannah_run.py collect --summarize")
+
+
 def _cli_delete(args):
     if args.run:
         if delete_run(args.run):
@@ -678,6 +757,11 @@ def main() -> None:
     pc.add_argument("--openai-model")
     pc.add_argument("--keep-memory", action="store_true")
     pc.add_argument("--no-restart", action="store_true")
+    pr = sub.add_parser("rerun", help="Start another run of an existing experiment, reusing its config.")
+    pr.add_argument("--experiment", required=True)
+    pr.add_argument("--keep-memory", action="store_true",
+                    help="Continue from the previous run's rolling memory "
+                    "(default: fresh replicate).")
     pd = sub.add_parser("delete", help="Delete an experiment (all runs + registry) or one run folder.")
     group = pd.add_mutually_exclusive_group(required=True)
     group.add_argument("--experiment", help="Experiment name: delete ALL its runs + registry entry.")
@@ -685,7 +769,7 @@ def main() -> None:
     pd.add_argument("--yes", action="store_true", help="Skip the confirmation prompt.")
     args = p.parse_args()
     {"start": _cli_start, "status": _cli_status, "collect": _cli_collect,
-     "delete": _cli_delete}[args.cmd](args)
+     "rerun": _cli_rerun, "delete": _cli_delete}[args.cmd](args)
 
 
 if __name__ == "__main__":

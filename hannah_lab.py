@@ -205,7 +205,25 @@ class LabControlHandler(SimpleHTTPRequestHandler):
             return self._delete()
         if path == "/api/lab/experiment/collect":
             return self._collect_start()
+        if path == "/api/lab/experiment/rerun":
+            return self._rerun()
+        if path == "/api/lab/daemon":
+            return self._daemon()
         self._json({"ok": False, "error": "not found"}, 404)
+
+    def _daemon(self):
+        """Start / stop / restart the Hannah daemon (hannah.service).
+
+        Starting the daemon also pulls up llama-server, since the unit
+        Requires=hannah-llama.service.
+        """
+        action = (self._read_json(max_len=200) or {}).get("action")
+        if action not in ("start", "stop", "restart"):
+            self._json({"ok": False,
+                        "error": "action must be start/stop/restart"})
+            return
+        hr.daemon_action(action)
+        self._json({"ok": True, "daemon_active": hr.daemon_active()})
 
     # -- endpoints --
     def _options(self):
@@ -292,6 +310,22 @@ class LabControlHandler(SimpleHTTPRequestHandler):
         except Exception:
             pass
         self._json({"ok": True})
+
+    def _rerun(self):
+        data = self._read_json(max_len=1000) or {}
+        name = (data.get("name") or "").strip()
+        keep = bool(data.get("keep_memory"))
+        try:
+            result = hr.rerun_experiment(name, keep_memory=keep, cfg=self.cfg,
+                                         log=lambda *a, **k: None)
+        except RuntimeError as exc:
+            self._json({"ok": False, "error": str(exc)})
+            return
+        try:
+            build(self.cfg, log=lambda *a, **k: None)
+        except Exception:
+            pass
+        self._json({"ok": True, **result})
 
     def _delete(self):
         name = (self._read_json(max_len=1000) or {}).get("name", "").strip()

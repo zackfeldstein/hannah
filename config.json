@@ -27,7 +27,8 @@
   "daemon": {
     "sense_tick_s": 20,
     "heartbeat_s": 120,
-    "min_gap_s": 60
+    "min_gap_s": 60,
+    "require_active_experiment": true
   },
   "memory": {
     "recent_entries": 6,

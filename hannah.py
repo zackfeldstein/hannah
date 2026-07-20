@@ -66,6 +66,16 @@ HEARTBEAT_FILE = LOG_DIR / "heartbeat.json"
 # keyed by fingerprint, so research exports can trace an entry to its exact prompt.
 PROMPT_HISTORY_DIR = LOG_DIR / "prompt_history"
 
+# Marker written by hannah_run.start_run while an experiment is active (removed
+# on collect). The daemon consults it so it can idle when no experiment is
+# running - see daemon.require_active_experiment.
+CURRENT_RUN_FILE = BASE_DIR / "research" / "current_run.json"
+
+
+def experiment_active() -> bool:
+    """True when an experiment is currently running (started via the web UI/CLI)."""
+    return CURRENT_RUN_FILE.exists()
+
 # Runtime configuration lives in an editable JSON file (override with HANNAH_CONFIG).
 # The values below are the defaults, used for any key the file doesn't set.
 CONFIG_FILE = _env_path("HANNAH_CONFIG", BASE_DIR / "config.json")
@@ -102,6 +112,11 @@ DEFAULT_CONFIG = {
         "sense_tick_s": 20,     # how often to cheaply sample telemetry
         "heartbeat_s": 900,     # write at least this often, even in total calm
         "min_gap_s": 90,        # debounce: minimum seconds between entries
+        # When true, the daemon only reflects (generates entries) while an
+        # experiment is active - i.e. one started via the web UI / hannah_run.
+        # It still runs and stays warm when idle, but does no work until you
+        # start an experiment. False = the classic always-on continuous mind.
+        "require_active_experiment": True,
     },
     "memory": {
         "recent_entries": 6,    # how many past entries to feed back as context
@@ -1314,25 +1329,45 @@ def run_daemon() -> None:
     signal.signal(signal.SIGTERM, _handle_stop)
     signal.signal(signal.SIGINT, _handle_stop)
 
-    # Notice and reflect on any downtime since the last run.
-    wake = wake_observation(cfg)
+    # When gated, the daemon does no work unless an experiment is active; it just
+    # stays warm and idles. Experiments are started via the web UI / hannah_run.
+    gated = cfg["daemon"].get("require_active_experiment", True)
+
+    def observing() -> bool:
+        return experiment_active() if gated else True
+
+    # Notice and reflect on any downtime since the last run (only while observing).
+    wake = wake_observation(cfg) if observing() else None
     if wake is not None:
         _say("detected a gap in existence; writing a waking entry.")
         reflect(wake, cfg, metrics=collect_metrics())
+
+    if gated and not observing():
+        _say("no active experiment; idling until one is started.")
 
     prev_sample = load_snapshot()
     last_reflection = 0.0
     tick = cfg["daemon"]["sense_tick_s"]
     heartbeat_s = cfg["daemon"]["heartbeat_s"]
     min_gap = cfg["daemon"]["min_gap_s"]
+    was_observing = observing()
 
     while not stop["flag"]:
         now = time.monotonic()
+        active = observing()
+        # Announce transitions so the journalctl log makes the idle/active
+        # boundary obvious.
+        if active != was_observing:
+            _say("experiment started; observing." if active
+                 else "experiment collected; idling until the next one.")
+            was_observing = active
+
         metrics = collect_metrics()
         is_salient, reasons = salience(metrics, prev_sample, cfg)
         heartbeat_due = (now - last_reflection) >= heartbeat_s
 
-        if (is_salient or heartbeat_due) and (now - last_reflection) >= min_gap:
+        if active and (is_salient or heartbeat_due) and \
+                (now - last_reflection) >= min_gap:
             observation = render_observation(metrics, load_snapshot(), _log_history())
             reflect(observation, cfg, metrics=metrics,
                     note="; ".join(reasons) if reasons else "")
@@ -1347,9 +1382,12 @@ def run_daemon() -> None:
             time.sleep(min(1.0, tick - slept))
             slept += 1.0
 
-    # Graceful shutdown: mark it, and try to write a short farewell entry.
-    _say("shutting down; writing a final entry.")
+    # Graceful shutdown: mark it, and (only mid-experiment) write a farewell.
+    _say("shutting down.")
     write_heartbeat(graceful=True)
+    if not observing():
+        _say("stopped.")
+        return
     farewell = (
         f"Timestamp: {datetime.now().isoformat(timespec='seconds')}\n"
         "You are being stopped now - asked to rest. In one or two sentences, "

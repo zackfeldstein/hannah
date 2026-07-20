@@ -410,6 +410,8 @@ failures.</p></div>"""]
 <span>{sum(len(r.entries) for r in runs)} entries</span>
 <span>last run {_fmt_date(latest.manifest.get('ended_at'))}</span>
 </div></a>
+<button class="tile-rerun" data-exp="{esc(name)}" title="Run this experiment again"
+  style="display:none">↻</button>
 <button class="tile-del" data-exp="{esc(name)}" title="Delete experiment"
   style="display:none">✕</button></div>""")
     body.append("</div>")
@@ -430,6 +432,18 @@ _EXP_CONTROLS_HTML = """
 <style>
 .labctl { margin:0 0 22px; }
 .labctl-bar { display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+.daemon-bar { margin-bottom:12px; padding-bottom:12px;
+  border-bottom:1px solid var(--border); }
+.daemon-status { display:flex; align-items:center; gap:8px; font-size:13px;
+  color:var(--body); margin-right:4px; }
+.daemon-status .dot { width:9px; height:9px; border-radius:50%;
+  background:var(--dim); }
+.daemon-status .dot.on { background:var(--accent); box-shadow:0 0 6px var(--accent); }
+.daemon-status .dot.off { background:var(--red); }
+.labctl .ghost { background:#fff; color:var(--muted); border:1px solid var(--border);
+  border-radius:8px; padding:6px 12px; font-size:12.5px; cursor:pointer; }
+.labctl .ghost:hover { filter:brightness(0.98); }
+.labctl .ghost:disabled { opacity:.45; cursor:default; }
 .labctl .btn-primary { background:var(--accent); color:#fff; border:none;
   border-radius:8px; padding:8px 16px; font-size:13px; font-weight:600;
   cursor:pointer; }
@@ -488,6 +502,19 @@ button.danger:hover { filter:brightness(1.04); }
   border-radius:50%; border:1px solid var(--border); background:#fff;
   color:var(--red); font-size:12px; line-height:1; cursor:pointer; padding:0; }
 .tile-del:hover { background:var(--red-soft); border-color:#eec7c9; }
+.tile-rerun { position:absolute; top:10px; right:40px; width:24px; height:24px;
+  border-radius:50%; border:1px solid var(--border); background:#fff;
+  color:var(--accent); font-size:14px; line-height:1; cursor:pointer; padding:0; }
+.tile-rerun:hover { background:var(--accent-soft); border-color:#bfe3cf; }
+.lab-modal { position:fixed; inset:0; background:rgba(20,24,30,.45);
+  display:flex; align-items:center; justify-content:center; z-index:50; }
+.lab-modal-box { background:var(--panel); border:1px solid var(--border);
+  border-radius:12px; padding:22px 24px; max-width:440px; width:calc(100% - 40px);
+  box-shadow:0 12px 40px rgba(0,0,0,.25); }
+.lab-modal-box h3 { margin:0 0 6px; }
+.lab-modal-box .ef-chk { display:flex; align-items:flex-start; gap:8px;
+  font-size:13px; color:var(--body); margin:8px 0; text-transform:none;
+  letter-spacing:normal; cursor:pointer; }
 .tile.running { border-style:solid; border-color:var(--accent);
   box-shadow:0 0 0 1px var(--accent) inset; opacity:1; }
 .running-badge { position:absolute; bottom:12px; right:12px; text-decoration:none;
@@ -498,6 +525,14 @@ button.danger:hover { filter:brightness(1.04); }
 @keyframes pulse { 0%,100%{opacity:1;} 50%{opacity:.35;} }
 </style>
 <div class="labctl" id="labctl" style="display:none">
+  <div class="labctl-bar daemon-bar">
+    <span class="daemon-status"><span class="dot" id="daemonDot"></span>
+      <span id="daemonState">checking…</span></span>
+    <button class="ghost" id="dStart">Start</button>
+    <button class="ghost" id="dStop">Stop</button>
+    <button class="ghost" id="dRestart">Restart</button>
+    <span class="muted" id="daemonMsg"></span>
+  </div>
   <div class="labctl-bar">
     <button class="btn-primary" id="newExpBtn">＋ New experiment</button>
     <span class="active-box" id="activeBox" style="display:none"></span>
@@ -572,7 +607,38 @@ _EXP_CONTROLS_SCRIPT = """
       b.onclick = function(e){ e.preventDefault(); e.stopPropagation();
         delExp(b.getAttribute('data-exp')); };
     });
+    document.querySelectorAll('.tile-rerun').forEach(function(b){
+      show(b, true);
+      b.onclick = function(e){ e.preventDefault(); e.stopPropagation();
+        rerunModal(b.getAttribute('data-exp')); };
+    });
+    document.getElementById('dStart').onclick = function(){ daemon('start'); };
+    document.getElementById('dStop').onclick = function(){ daemon('stop'); };
+    document.getElementById('dRestart').onclick = function(){ daemon('restart'); };
     updateActive(o);
+  }
+
+  function refreshOptions(){
+    fetch(API + '/options').then(function(r){ return r.json(); })
+      .then(function(o){ updateActive(o); }).catch(function(){});
+  }
+  function daemon(action){
+    var dmsg = document.getElementById('daemonMsg');
+    dmsg.textContent = action + 'ing… (starting can take ~30s while the model loads)';
+    post('/daemon', {action: action}).then(function(d){
+      dmsg.textContent = d.ok ? '' : ('error: ' + (d.error||'failed'));
+      refreshOptions();
+    }).catch(function(){ dmsg.textContent = 'error'; });
+  }
+  function updateDaemon(o){
+    var dot = document.getElementById('daemonDot');
+    var st = document.getElementById('daemonState');
+    if (!dot) return;
+    var on = !!o.daemon_active;
+    dot.className = 'dot ' + (on ? 'on' : 'off');
+    st.textContent = on ? 'daemon running' : 'daemon stopped';
+    document.getElementById('dStart').disabled = on;
+    document.getElementById('dStop').disabled = !on;
   }
 
   function setAll(on){
@@ -606,6 +672,38 @@ _EXP_CONTROLS_SCRIPT = """
       else { st.textContent = 'error: ' + (d.error||'failed'); btn.disabled = false; }
     }).catch(function(){ st.textContent = 'error starting'; btn.disabled = false; });
   };
+
+  function rerunModal(name){
+    var ov = document.createElement('div');
+    ov.className = 'lab-modal';
+    ov.innerHTML =
+      '<div class="lab-modal-box"><h3>Run “'+esc(name)+'” again</h3>'
+      + '<p class="muted">Starts another run under the same experiment, reusing '
+      + 'its model, tools, and prompt. The lab groups the runs together and '
+      + 'tracks how beliefs and memory evolve across them.</p>'
+      + '<label class="ef-chk"><input type="radio" name="rmem" value="fresh" checked> '
+      + '<span><b>Fresh replicate</b> — reset rolling memory. An independent '
+      + 'trial under the same conditions (best for reproducibility).</span></label>'
+      + '<label class="ef-chk"><input type="radio" name="rmem" value="keep"> '
+      + '<span><b>Continue from last run</b> — restore the previous run\\'s '
+      + 'memory and build on it.</span></label>'
+      + '<div class="ef-actions"><button class="btn-primary" id="rerunGo">Run again</button>'
+      + '<button class="ghost" id="rerunCancel">Cancel</button>'
+      + '<span class="ef-status" id="rerunStatus"></span></div></div>';
+    document.body.appendChild(ov);
+    function close(){ ov.remove(); }
+    ov.addEventListener('click', function(e){ if (e.target === ov) close(); });
+    ov.querySelector('#rerunCancel').onclick = close;
+    ov.querySelector('#rerunGo').onclick = function(){
+      var keep = ov.querySelector('input[name=rmem]:checked').value === 'keep';
+      var st = ov.querySelector('#rerunStatus'); st.textContent = 'starting…';
+      var go = ov.querySelector('#rerunGo'); go.disabled = true;
+      post('/experiment/rerun', {name: name, keep_memory: keep}).then(function(d){
+        if (d.ok){ st.textContent = '✓ started — reloading'; location.reload(); }
+        else { st.textContent = 'error: ' + (d.error||'failed'); go.disabled = false; }
+      }).catch(function(){ st.textContent = 'error'; go.disabled = false; });
+    };
+  }
 
   function delExp(name){
     var typed = window.prompt('Delete experiment "'+name+'" and ALL of its runs?\\n'
@@ -660,6 +758,7 @@ _EXP_CONTROLS_SCRIPT = """
   }
 
   function updateActive(o){
+    updateDaemon(o);
     markRunning(o);
     var box = document.getElementById('activeBox');
     var newBtn = document.getElementById('newExpBtn');
