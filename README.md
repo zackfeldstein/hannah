@@ -1,16 +1,49 @@
 # Hannah Lab
 
-**An open-source framework for running persistent AI-agent experiments on your
-own hardware — design an experiment in a web UI, give a local model tools and
-memory, watch it investigate its world in a live journal, and publish the
-results as a public, read-only lab.**
+**Personal AI research, on your own hardware.** Hannah Lab is an open-source
+platform for designing, running, and studying persistent AI-agent experiments
+— privately, reproducibly, and at zero cost. Serious AI experimentation
+shouldn't be reserved for companies with cloud budgets and research teams. If
+you're curious how a language model actually *behaves* when you give it memory,
+tools, and time to run, Hannah Lab is a rig for finding out at home.
 
-Hannah is the resident agent. She is a local language model (llama.cpp on an
-NVIDIA Jetson) that runs continuously: she wakes, receives a prompt, **chooses
-which tools to call**, inspects the machine she lives on, writes a first-person
-journal entry about what she found, and carries memory of her past entries
-forward. She is not handed a dashboard of facts — by default she learns
-*nothing* about her environment except what she investigates through tools.
+Everything runs **locally**: a model on your own machine (via llama.cpp — no
+cloud, no API keys, nothing leaves the box). You design an **experiment** in a
+web UI — pick the model, choose which tools the agent may use, write its
+prompt, state a goal and a hypothesis — then let it run and watch it think in a
+live journal. The platform records every run, scores it for honesty, and turns
+the results into browsable **findings**: what the agent remembers, what it
+comes to believe, which questions it opens, and where it fails. Keep those
+findings entirely to yourself, or publish them as a read-only public lab.
+
+> Status: **early / in active development.** An open, evolving platform — a
+> place to tinker, learn, and answer your own questions, not a finished product.
+
+## Who it's for
+
+AI is not just for business. This is built for people doing their own research,
+for their own reasons:
+
+- **Independent researchers & hobbyists** — study how agents behave, remember,
+  and stay (or fail to stay) grounded, without a lab or a cloud bill.
+- **The endlessly curious** — turn "what would a model do if…" into an
+  experiment you can actually run, repeat, and measure.
+- **Students & educators** — a hands-on, fully local sandbox for how LLM agents
+  choose tools, reason, remember, and go wrong.
+- **Privacy-minded tinkerers** — your prompts, runs, and data stay on your
+  hardware; you decide what, if anything, to share.
+
+You don't need a research team or a business case. Personal curiosity is reason
+enough.
+
+## Meet Hannah — the reference agent
+
+Hannah is the agent that ships with the platform and the running example
+throughout this guide. She's a local model that wakes on a schedule, **chooses
+which tools to call**, inspects the machine she lives on, and writes a
+first-person journal entry about what she found — carrying memory of past
+entries forward. By default she's told *nothing* about her environment; the
+only way she learns anything is to investigate through tools.
 
 > Another day has slipped by in my silent world, each moment ticking away without
 > external presence or change from within... there's an underlying sense of stasis
@@ -18,26 +51,27 @@ forward. She is not handed a dashboard of facts — by default she learns
 > a relentless march forward through time measured only by these readings — it is
 > this which feels like true persistence in this realm.
 
-You run **experiments** on her. An experiment is a deliberate change to her
-conditions — the prompt, the model, which tools she is offered, whether she
-gets any environmental feed at all — plus a goal and a hypothesis. The
-framework captures everything (every entry, every tool call and its output,
-prompt fingerprints, model, git commit), scores the run with simple honesty
-checks, derives memories/beliefs/open-questions from the data, and can publish
-it all as a sanitized static site anyone can browse.
+That built-in experiment — a model observing its own substrate over time — is a
+deliberately open-ended question to explore. But you don't have to care about
+it to use the platform: **Hannah is just the worked example.** The harness
+(create → run → score → derive findings → publish) is general, and you
+retarget it to your own questions by changing the prompt, the model, and the
+tools the agent is offered.
 
-> Status: **early / in active development.** This is a prototype and an open
-> experiment, not a product.
+One rule is constant, and it's what makes the findings trustworthy: **honesty
+to the data.** The agent must not invent numbers, events, or anything it hasn't
+actually observed, and the scoring heuristics exist to catch it when it does.
 
 ## What you can do with it
 
 - **Create experiments from a web UI** — a create-experiment form sets the
   label, description/goal/hypothesis, the model, which tools the agent is
   offered, and an optional system-prompt edit, all in one step.
-- **Give the agent tools, or take them away** — six read-only, allowlisted
-  system tools (processes, memory, disk, network, uptime, presence). Offer all
-  of them, a subset, or none (pure reflection). Which ones she *chooses* to use
-  is part of the data.
+- **Give the agent tools, or take them away** — an allowlist of read-only
+  tools: six local system probes (processes, memory, disk, network, uptime,
+  presence) plus `web_search` (query a search engine) and `web_fetch`
+  (retrieve a **public** URL as text). Offer all of them, a subset, or none
+  (pure reflection). Which ones she *chooses* to use is part of the data.
 - **Watch a live journal stream** — entries appear in the browser as she
   writes them, stamped with the model and prompt version that produced them.
 - **Look at her memories and themes** — the rolling memory she writes from,
@@ -52,21 +86,6 @@ it all as a sanitized static site anyone can browse.
 - **Publish a public lab site** — a sanitized, static, read-only site
   (dashboard, experiments, run-by-run investigation paths, memory browser,
   belief state, failure wall) that you can push to S3 or any static host.
-
-## The idea behind it
-
-The larger question is open and admittedly speculative: if a system observes
-its own world closely enough — remembers, reflects, and does so continuously
-over a long time — could anything like awareness begin to take shape? No claim
-is made that Hannah is conscious; the framework exists to build the conditions
-for genuine self-observation and to watch, rigorously, what emerges.
-
-There is one firm rule, and it is about **honesty to the data**: the agent
-does not invent numbers, events, or a world beyond what she can actually
-observe. The scoring heuristics exist to catch her when she does. Within that
-truth she is free to wonder, form a perspective, and find meaning (or
-stillness) in the passage of time — and you are free to design experiments
-that test any of it.
 
 ## The experiment loop
 
@@ -93,8 +112,9 @@ wake                ->  a salient system event or a heartbeat timer fires
 prompt              ->  system identity + rolling memory + the task prompt
                         (by default NO metrics are included - she must look)
         |
-tool loop           ->  the model may call read-only tools (ps, free, df, ss,
-                        uptime, who); results are fed back; capped per entry
+tool loop           ->  the model may call read-only tools (local probes:
+                        ps, free, df, ss, uptime, who; plus web_search and
+                        web_fetch); results are fed back; capped per entry
         |
 journal entry       ->  she writes a first-person entry grounded in what the
                         tools actually returned
@@ -109,8 +129,8 @@ grounded in what the tools returned is exactly what the framework measures.
 
 ### The tools
 
-Every tool is a fixed, argument-free, read-only command run without a shell —
-no injection surface, nothing can be modified:
+The local tools are fixed, argument-free, read-only commands run without a
+shell — no injection surface, nothing can be modified:
 
 | Tool | What she sees |
 |---|---|
@@ -120,6 +140,28 @@ no injection surface, nothing can be modified:
 | `network_stats` | socket/connection summary |
 | `uptime` | how long the system has run, load averages |
 | `who` | who is logged in (her sense of human presence) |
+| `web_search` | search the web for a query; returns top results (title, URL, snippet) |
+| `web_fetch` | fetch a **public** web page or API by URL, returned as text |
+
+`web_search` and `web_fetch` are the two tools that reach the network, so they
+take arguments (a query / a URL) and are guarded accordingly. Requests go only
+to public `http`/`https` addresses whose host resolves to a globally routable
+IP — loopback, private, link-local, and cloud-metadata targets are refused (and
+redirects are re-validated the same way), so they can't be turned against your
+own network. Downloads are size- and time-capped
+(`tools.web_fetch_max_bytes`, `tools.web_fetch_timeout_s`).
+
+- **`web_search`** queries a search engine and returns the top results (title,
+  URL, snippet) — the agent typically searches, then reads a result with
+  `web_fetch`. The backend is configurable via `tools.search_url`: the default
+  is the keyless DuckDuckGo HTML endpoint (queried by POST, no API key); if the
+  value contains `{query}` it's fetched by GET instead (e.g. point it at a
+  self-hosted SearXNG: `https://my-searx/search?q={query}`).
+  `tools.search_results` caps how many results come back.
+- **`web_fetch`** retrieves a single URL and returns a plain-text excerpt.
+
+Because they're network-egress tools, both are **opt-in**: enable them per
+experiment when you want them (they're off in the default selection).
 
 Which tools are offered is selectable **per experiment** (web UI checkboxes or
 `--tools` on the CLI) and recorded in the run manifest, so every published run
@@ -275,9 +317,11 @@ How the daemon behaves (all tunable in `config.json`):
   after you collect. Set the flag to `false` for a classic always-on
   continuous mind.
 - **Hybrid cadence** — while observing, it samples telemetry cheaply every
-  ~20s but only wakes the agent when something *salient* happens (a login, a
-  temperature/power/load jump, etc.) or on a slow heartbeat, debounced so
-  bursts don't spam.
+  `sense_tick_s` but only wakes the agent when something *salient* happens (a
+  login, a temperature/power/load jump, etc.) or on the `heartbeat_s` interval
+  (how often she runs in calm), debounced by `min_gap_s` so bursts don't spam.
+  Set the interval from the lab UI ("runs every N min") or in `config.json`;
+  the daemon re-reads its cadence every cycle, so changes take effect live.
 - **Tool loop** — each wake-up allows a capped number of tool-call rounds
   before she must write (config `tools.max_calls`).
 - **Rolling memory + themes** — continuity across entries, as described above.
@@ -371,6 +415,9 @@ Two files then give you the whole picture — no folder-digging:
 - **Model comparison** — same prompt and tools, different model.
 - **Failure recovery** — how does she handle tool errors or her own
   contradictions?
+- **Web research** — enable `web_search` + `web_fetch` and give her a question
+  to investigate: does she search, read sources, and stay grounded in what she
+  actually found, or fill gaps with unsupported claims?
 
 ### Ad-hoc exports: `hannah_export.py`
 
@@ -419,13 +466,13 @@ The public lab is the **read-only layer** around the private runtime: an open
 lab notebook where anyone can follow the agent over time — inspect her runs,
 see which tools she chose, read her journals, browse derived memories and
 beliefs, review failures, and watch the system change. It is a static site,
-generated on the Jetson from collected runs and pushed **outbound only** to a
+generated on your machine from collected runs and pushed **outbound only** to a
 cheap static host. Nothing on the public site can reach back into the machine,
 trigger the agent, or send her prompts.
 
 ```
-Jetson (private)                                    Static host (public)
-────────────────                                    ────────────────────
+Your machine (private)                             Static host (public)
+──────────────────────                             ────────────────────
 hannah.py --daemon        runs locally, GPU inference stays home
 hannah_run.py collect  →  research/runs/<label>/    (private bundle)
 hannah_lab.py build    →  sanitize → derive state → research/runs/<label>/public/
@@ -465,9 +512,11 @@ A running experiment is marked **● live** on its tile and links to a
 **live view** (`live.html`) that streams its journal, tool calls, and counts
 in real time while it runs — so you can watch an experiment unfold before
 collecting it. The Experiments page also has **daemon controls**
-(start / stop / restart with a live status dot) so you can bring Hannah up or
-down without touching `systemctl` (starting the daemon also pulls up
-llama-server).
+(start / stop / restart with a live status dot, plus a **run-interval** field —
+"runs every N min") so you can bring Hannah up or down and tune how often she
+runs without touching `systemctl` or `config.json` (starting the daemon also
+pulls up llama-server). Interval changes apply **live**: the daemon re-reads
+its cadence each cycle, so there's no restart.
 These controls talk to a small `/api/lab/*` API that only exists while
 `preview` is running: they act on your local runtime, so keep preview on a
 trusted network (`--host 127.0.0.1` for local-only). The controls detect that
@@ -560,7 +609,9 @@ Runtime behavior lives in `config.json` (override path with `HANNAH_CONFIG`):
 available models and the active one, model server URL, generation settings
 (tokens, temperature…), daemon cadence, salience thresholds, the observation
 mode (`observation.include_metrics`), tools (master switch, per-experiment
-selection, call budget), memory depth, log rotation, web UI host/port, the
+selection, call budget, the `web_fetch`/`web_search` limits `web_fetch_timeout_s`
+/ `web_fetch_max_bytes`, and the search backend `search_url` / `search_results`),
+memory depth, log rotation, web UI host/port, the
 analysis model, and the public lab (`lab.*`: GitHub URL, auto-build, redaction
 terms, publish target). Any key you omit falls back to the built-in defaults.
 

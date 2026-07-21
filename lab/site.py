@@ -444,6 +444,11 @@ _EXP_CONTROLS_HTML = """
   border-radius:8px; padding:6px 12px; font-size:12.5px; cursor:pointer; }
 .labctl .ghost:hover { filter:brightness(0.98); }
 .labctl .ghost:disabled { opacity:.45; cursor:default; }
+.daemon-interval { display:flex; align-items:center; gap:6px; font-size:12.5px;
+  color:var(--muted); }
+.daemon-interval input { width:60px; background:#fff; color:var(--text);
+  border:1px solid var(--border); border-radius:7px; padding:5px 7px;
+  font-size:12.5px; }
 .labctl .btn-primary { background:var(--accent); color:#fff; border:none;
   border-radius:8px; padding:8px 16px; font-size:13px; font-weight:600;
   cursor:pointer; }
@@ -531,6 +536,9 @@ button.danger:hover { filter:brightness(1.04); }
     <button class="ghost" id="dStart">Start</button>
     <button class="ghost" id="dStop">Stop</button>
     <button class="ghost" id="dRestart">Restart</button>
+    <span class="daemon-interval">runs every
+      <input type="number" id="intervalMin" min="0.25" step="0.25" value="">
+      min <button class="ghost" id="intervalSave">Set</button></span>
     <span class="muted" id="daemonMsg"></span>
   </div>
   <div class="labctl-bar">
@@ -615,7 +623,28 @@ _EXP_CONTROLS_SCRIPT = """
     document.getElementById('dStart').onclick = function(){ daemon('start'); };
     document.getElementById('dStop').onclick = function(){ daemon('stop'); };
     document.getElementById('dRestart').onclick = function(){ daemon('restart'); };
+    document.getElementById('intervalSave').onclick = saveInterval;
     updateActive(o);
+  }
+
+  function saveInterval(){
+    var el = document.getElementById('intervalMin');
+    var dmsg = document.getElementById('daemonMsg');
+    var mins = parseFloat(el.value);
+    if (!(mins > 0)) { dmsg.textContent = 'enter minutes > 0'; return; }
+    var secs = Math.round(mins * 60);
+    dmsg.textContent = 'saving interval…';
+    post('/daemon/interval', {heartbeat_s: secs}).then(function(d){
+      if (d.ok){
+        dmsg.textContent = '✓ runs every ' + fmtInterval(d.daemon_cadence.heartbeat_s)
+          + ' (applies on the next cycle)';
+        setTimeout(function(){ dmsg.textContent = ''; }, 6000);
+      } else { dmsg.textContent = 'error: ' + (d.error||'failed'); }
+    }).catch(function(){ dmsg.textContent = 'error'; });
+  }
+  function fmtInterval(s){
+    if (s % 60 === 0) return (s/60) + ' min';
+    return s + 's';
   }
 
   function refreshOptions(){
@@ -639,6 +668,11 @@ _EXP_CONTROLS_SCRIPT = """
     st.textContent = on ? 'daemon running' : 'daemon stopped';
     document.getElementById('dStart').disabled = on;
     document.getElementById('dStop').disabled = !on;
+    // Reflect the current interval, but don't clobber the field while editing.
+    var el = document.getElementById('intervalMin');
+    if (el && o.daemon_cadence && document.activeElement !== el){
+      el.value = +(o.daemon_cadence.heartbeat_s / 60).toFixed(2);
+    }
   }
 
   function setAll(on){

@@ -67,6 +67,39 @@ def _git_info():
     return commit, dirty
 
 
+def daemon_cadence(cfg=None) -> dict:
+    """Current daemon cadence (seconds): interval + debounce + sample tick."""
+    d = (cfg or hannah.load_config())["daemon"]
+    return {
+        "heartbeat_s": int(d.get("heartbeat_s", 900)),
+        "min_gap_s": int(d.get("min_gap_s", 90)),
+        "sense_tick_s": int(d.get("sense_tick_s", 20)),
+    }
+
+
+def set_daemon_interval(heartbeat_s, cfg=None, log=print) -> dict:
+    """Set how often Hannah runs (the heartbeat interval, in seconds).
+
+    Persists to config.json and applies live - the daemon re-reads its cadence
+    each cycle, so no restart is needed. min_gap_s and sense_tick_s are clamped
+    to not exceed the interval so the chosen cadence is actually honored.
+    """
+    try:
+        hb = int(round(float(heartbeat_s)))
+    except (TypeError, ValueError):
+        raise RuntimeError("interval must be a number of seconds")
+    hb = max(15, min(hb, 24 * 3600))   # floor 15s, ceiling 24h
+    cur = (cfg or hannah.load_config())["daemon"]
+    updates = {"daemon": {
+        "heartbeat_s": hb,
+        "min_gap_s": min(int(cur.get("min_gap_s", 90)), hb),
+        "sense_tick_s": min(int(cur.get("sense_tick_s", 20)), hb),
+    }}
+    hannah.update_config_file(updates)
+    log(f"Daemon run interval set to {hb}s (applies on the next cycle).")
+    return updates["daemon"]
+
+
 def restart_llama(log=print) -> None:
     """Reload llama-server so a newly selected model takes effect."""
     try:

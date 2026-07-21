@@ -209,7 +209,20 @@ class LabControlHandler(SimpleHTTPRequestHandler):
             return self._rerun()
         if path == "/api/lab/daemon":
             return self._daemon()
+        if path == "/api/lab/daemon/interval":
+            return self._daemon_interval()
         self._json({"ok": False, "error": "not found"}, 404)
+
+    def _daemon_interval(self):
+        """Set how often the daemon runs (heartbeat interval, seconds)."""
+        hb = (self._read_json(max_len=200) or {}).get("heartbeat_s")
+        try:
+            cadence = hr.set_daemon_interval(hb, cfg=self.cfg,
+                                             log=lambda *a, **k: None)
+        except RuntimeError as exc:
+            self._json({"ok": False, "error": str(exc)})
+            return
+        self._json({"ok": True, "daemon_cadence": cadence})
 
     def _daemon(self):
         """Start / stop / restart the Hannah daemon (hannah.service).
@@ -238,6 +251,7 @@ class LabControlHandler(SimpleHTTPRequestHandler):
             "enabled_tools": hannah.enabled_tool_names(cfg),
             "current_prompt": hannah.load_system_prompt(),
             "daemon_active": hr.daemon_active(),
+            "daemon_cadence": hr.daemon_cadence(cfg),
             "active": hr.active_run(cfg),
             "collecting": {"running": _collect["running"],
                            "done": _collect["done"],

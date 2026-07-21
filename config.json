@@ -37,7 +37,11 @@
   "tools": {
     "enabled": true,
     "max_calls": 3,
-    "output_chars": 1500
+    "output_chars": 1500,
+    "web_fetch_timeout_s": 8,
+    "web_fetch_max_bytes": 200000,
+    "search_url": "https://html.duckduckgo.com/html/",
+    "search_results": 5
   },
   "observation": {
     "include_metrics": false

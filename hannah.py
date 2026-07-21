@@ -18,13 +18,16 @@ that truth she is free to reflect in her own voice.
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import os
 import re
 import signal
+import socket
 import subprocess
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime
 from pathlib import Path
@@ -130,6 +133,15 @@ DEFAULT_CONFIG = {
         # Selectable per experiment via the web UI or hannah_run.py --tools;
         # the runtime selection (logs/enabled_tools.json) overrides this.
         "enabled_tools": None,
+        # web_fetch / web_search reach the network. Only public URLs are allowed
+        # - private/loopback/link-local/metadata targets are blocked so the tools
+        # can never be used to probe your home network.
+        "web_fetch_timeout_s": 8,
+        "web_fetch_max_bytes": 200000,
+        # web_search backend: any URL template containing "{query}" (keyless
+        # DuckDuckGo HTML by default), and how many results to return.
+        "search_url": "https://html.duckduckgo.com/html/?q={query}",
+        "search_results": 5,
     },
     "observation": {
         # When false, Hannah is fed NO metrics - only the task prompt - so she must
@@ -194,6 +206,22 @@ def load_config() -> dict:
     except (OSError, ValueError):
         user_cfg = {}
     return _deep_merge(DEFAULT_CONFIG, user_cfg)
+
+
+def update_config_file(updates: dict) -> dict:
+    """Deep-merge `updates` into the on-disk config.json (creating it if needed).
+
+    Only the given keys change; everything else in the file is preserved. The
+    running daemon re-reads config each cycle, so edits take effect live.
+    Returns the merged full config.
+    """
+    try:
+        current = json.loads(CONFIG_FILE.read_text())
+    except (OSError, ValueError):
+        current = {}
+    merged = _deep_merge(current, updates)
+    CONFIG_FILE.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")
+    return _deep_merge(DEFAULT_CONFIG, merged)
 
 
 # --- Model selection ----------------------------------------------------------
@@ -927,9 +955,204 @@ def run_llama_server(messages: list, cfg: dict) -> str:
     return _message_text(_server_chat(messages, cfg))
 
 
+# --- web tools: the only tools that touch the network -------------------------
+# web_fetch (fetch a URL) and web_search (query a search engine) reach the
+# network, so they need real guardrails. Requests go ONLY to public http(s)
+# addresses: the scheme is checked, the host is resolved, and the request is
+# refused if any resolved address is loopback, private, link-local, or otherwise
+# not globally routable (this blocks SSRF - e.g. cloud metadata endpoints or
+# your LAN). Redirects are re-validated the same way. Downloads are size- and
+# time-capped. Both tools are network egress, so they are opt-in per experiment.
+_WEB_UA = "HannahLab/1.0 (+https://github.com/zackfeldstein/hannah)"
+# Default search backend: DuckDuckGo's keyless HTML endpoint (queried by POST).
+# Override with tools.search_url. If the value contains "{query}" the query is
+# substituted and fetched by GET (e.g. a self-hosted SearXNG:
+# "https://my-searx/search?q={query}"); otherwise the query is POSTed as "q".
+DEFAULT_SEARCH_URL = "https://html.duckduckgo.com/html/"
+
+_TAG_RE = re.compile(r"(?is)<(script|style)[^>]*>.*?</\1>")
+_ANGLE_RE = re.compile(r"(?s)<[^>]+>")
+_WS_RE = re.compile(r"[ \t\r\f\v]+")
+_BLANKS_RE = re.compile(r"\n\s*\n\s*")
+# DuckDuckGo HTML result anchors + snippets.
+_RESULT_A_RE = re.compile(
+    r'<a[^>]+class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+    re.I | re.S)
+_SNIPPET_RE = re.compile(
+    r'<a[^>]+class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</a>', re.I | re.S)
+
+
+def _host_is_public(host: str) -> bool:
+    """True only if every address the host resolves to is globally routable."""
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except (socket.gaierror, UnicodeError, OSError):
+        return False
+    addrs = {info[4][0] for info in infos}
+    if not addrs:
+        return False
+    for addr in addrs:
+        try:
+            ip = ipaddress.ip_address(addr.split("%")[0])  # strip zone id
+        except ValueError:
+            return False
+        if not ip.is_global or ip.is_private or ip.is_loopback \
+                or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+            return False
+    return True
+
+
+def _check_public_url(url: str) -> str:
+    """Return an error string if the URL is unsafe to fetch, else ""."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return "malformed URL"
+    if parts.scheme not in ("http", "https"):
+        return "only http/https URLs are allowed"
+    if not parts.hostname:
+        return "URL has no host"
+    if not _host_is_public(parts.hostname):
+        return "refusing to fetch a non-public address (private/loopback/link-local)"
+    return ""
+
+
+class _ValidatingRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Re-validate every redirect target so a public URL can't bounce inward."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if _check_public_url(newurl):
+            raise urllib.error.URLError(f"blocked redirect to {newurl!r}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _html_to_text(html_text: str) -> str:
+    """Crude HTML→text: drop script/style, strip tags, unescape, tidy space."""
+    import html as _html
+    text = _TAG_RE.sub(" ", html_text)
+    text = _ANGLE_RE.sub(" ", text)
+    text = _html.unescape(text)
+    text = _WS_RE.sub(" ", text)
+    text = _BLANKS_RE.sub("\n\n", text)
+    return text.strip()
+
+
+def _strip_tags(fragment: str) -> str:
+    """Turn a small HTML fragment (e.g. a result title) into clean text."""
+    import html as _html
+    return _WS_RE.sub(" ", _html.unescape(_ANGLE_RE.sub(" ", fragment))).strip()
+
+
+def _fetch_text(url: str, cfg: dict, accept: str, data: bytes = None):
+    """Safe fetch of a public URL. Returns (body, content_type, truncated).
+
+    GET by default; if `data` is given it becomes a form POST. Raises
+    urllib/OSError/ValueError on failure. The caller must have already passed
+    the URL through _check_public_url; redirects are re-validated here.
+    """
+    tcfg = cfg.get("tools", {})
+    opener = urllib.request.build_opener(_ValidatingRedirectHandler())
+    headers = {"User-Agent": _WEB_UA, "Accept": accept}
+    if data is not None:
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    req = urllib.request.Request(url, data=data, headers=headers)
+    max_bytes = int(tcfg.get("web_fetch_max_bytes", 200000))
+    with opener.open(req, timeout=tcfg.get("web_fetch_timeout_s", 8)) as resp:
+        ctype = resp.headers.get("Content-Type", "")
+        raw = resp.read(max_bytes + 1)
+    return raw[:max_bytes].decode("utf-8", "replace"), ctype, len(raw) > max_bytes
+
+
+def web_fetch(url: str, cfg: dict = None, output_chars: int = 1500) -> str:
+    """Fetch a public web page/API and return a capped plain-text excerpt."""
+    cfg = cfg or load_config()
+    url = (url or "").strip()
+    if not url:
+        return "(tool error: no url given)"
+    problem = _check_public_url(url)
+    if problem:
+        return f"(blocked: {problem})"
+    try:
+        body, ctype, truncated = _fetch_text(
+            url, cfg, "text/html,application/json,text/plain;q=0.9,*/*;q=0.5")
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        return f"(tool error: {exc})"
+    if "html" in ctype.lower() or (not ctype and "<html" in body[:2000].lower()):
+        body = _html_to_text(body)
+    else:
+        body = body.strip()
+    if truncated:
+        body += "\n… (truncated)"
+    return (f"[fetched {url}]\n" + body)[:output_chars]
+
+
+def _decode_result_href(href: str) -> str:
+    """Resolve a search-result link, unwrapping DuckDuckGo's redirect form."""
+    if "uddg=" in href:
+        m = re.search(r"[?&]uddg=([^&]+)", href)
+        if m:
+            return urllib.parse.unquote(m.group(1))
+    if href.startswith("//"):
+        return "https:" + href
+    return href
+
+
+def _parse_search_results(html_text: str, n: int) -> list:
+    """Parse (title, url, snippet) tuples from a DuckDuckGo HTML results page."""
+    links = _RESULT_A_RE.findall(html_text)
+    snippets = _SNIPPET_RE.findall(html_text)
+    out = []
+    for i, (href, title) in enumerate(links[:n]):
+        out.append((
+            _strip_tags(title),
+            _decode_result_href(href),
+            _strip_tags(snippets[i]) if i < len(snippets) else "",
+        ))
+    return out
+
+
+def web_search(query: str, cfg: dict = None, output_chars: int = 1500) -> str:
+    """Search the web and return the top results (title, URL, snippet).
+
+    Hits the configured search endpoint (keyless DuckDuckGo HTML by default);
+    the model can then read a result with web_fetch.
+    """
+    cfg = cfg or load_config()
+    tcfg = cfg.get("tools", {})
+    query = (query or "").strip()
+    if not query:
+        return "(tool error: no query given)"
+    template = tcfg.get("search_url") or DEFAULT_SEARCH_URL
+    if "{query}" in template:  # GET-style engine (e.g. SearXNG)
+        url = template.replace("{query}", urllib.parse.quote(query))
+        data = None
+    else:                      # POST the query as a form field
+        url = template
+        data = urllib.parse.urlencode({"q": query}).encode("utf-8")
+    problem = _check_public_url(url)
+    if problem:
+        return f"(blocked: search endpoint {problem})"
+    try:
+        body, _ctype, _trunc = _fetch_text(url, cfg, "text/html,*/*;q=0.5",
+                                           data=data)
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        return f"(tool error: {exc})"
+    results = _parse_search_results(body, int(tcfg.get("search_results", 5)))
+    if not results:
+        return (f"[search: {query}] (no results parsed - the search endpoint "
+                "may have changed or blocked the request)")
+    lines = [f"[search: {query}]"]
+    for i, (title, link, snippet) in enumerate(results, 1):
+        lines.append(f"{i}. {title}\n   {link}"
+                     + (f"\n   {snippet}" if snippet else ""))
+    return "\n".join(lines)[:output_chars]
+
+
 # --- Tools: a small, read-only allowlist Hannah *may* choose to use -----------
-# Every tool is a fixed command run without a shell (no arguments from the model),
-# so there is no injection surface. They only read state; none can modify anything.
+# Local tools are fixed commands run without a shell (no arguments from the
+# model), so there is no injection surface; they only read state. web_fetch is
+# the one tool that takes an argument (a URL) and reaches the network, guarded
+# as described above.
 TOOLS = {
     "list_processes": {
         "argv": ["ps", "-eo", "pid,pcpu,pmem,comm", "--sort=-pcpu"],
@@ -955,6 +1178,38 @@ TOOLS = {
     "who": {
         "argv": ["who"],
         "description": "Show who is currently logged in.",
+    },
+    "web_search": {
+        "handler": "web_search",
+        "description": ("Search the web for a query and get back the top "
+                        "results (title, URL, snippet). Follow up with "
+                        "web_fetch to read a result in full."),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The search query.",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+    "web_fetch": {
+        "handler": "web_fetch",
+        "description": ("Fetch a public web page or API by URL (http/https) and "
+                        "return a short plain-text excerpt. Only public "
+                        "addresses are reachable."),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "The absolute http(s) URL to fetch.",
+                },
+            },
+            "required": ["url"],
+        },
     },
 }
 
@@ -1003,24 +1258,33 @@ def set_enabled_tools(names, cfg: dict = None) -> bool:
 def tool_schemas(cfg: dict = None) -> list:
     """OpenAI-style function schemas for the currently enabled tools."""
     enabled = set(enabled_tool_names(cfg))
+    empty = {"type": "object", "properties": {}, "required": []}
     return [
         {
             "type": "function",
             "function": {
                 "name": name,
                 "description": spec["description"],
-                "parameters": {"type": "object", "properties": {}, "required": []},
+                "parameters": spec.get("parameters", empty),
             },
         }
         for name, spec in TOOLS.items() if name in enabled
     ]
 
 
-def run_tool(name: str, output_chars: int = 1500) -> str:
-    """Execute an allowlisted read-only tool and return its (capped) output."""
+def run_tool(name: str, output_chars: int = 1500, args: dict = None,
+             cfg: dict = None) -> str:
+    """Execute an allowlisted tool and return its (capped) output.
+
+    Local tools ignore `args`; web_fetch reads `args['url']`.
+    """
     spec = TOOLS.get(name)
     if not spec:
         return f"(unknown tool: {name})"
+    if spec.get("handler") == "web_fetch":
+        return web_fetch((args or {}).get("url", ""), cfg, output_chars)
+    if spec.get("handler") == "web_search":
+        return web_search((args or {}).get("query", ""), cfg, output_chars)
     try:
         result = subprocess.run(
             spec["argv"], capture_output=True, text=True, timeout=10,
@@ -1290,14 +1554,29 @@ def _reflect_loop(messages: list, cfg: dict):
             for tc in calls:
                 fn = tc.get("function", {})
                 name = fn.get("name", "")
+                # Arguments arrive as a JSON string (e.g. web_fetch's url).
+                raw_args = fn.get("arguments")
+                if isinstance(raw_args, str):
+                    try:
+                        args = json.loads(raw_args) if raw_args.strip() else {}
+                    except ValueError:
+                        args = {}
+                elif isinstance(raw_args, dict):
+                    args = raw_args
+                else:
+                    args = {}
                 if name in enabled:
-                    output = run_tool(name, tcfg.get("output_chars", 1500))
+                    output = run_tool(name, tcfg.get("output_chars", 1500),
+                                      args=args, cfg=cfg)
                 else:
                     # She called a tool she wasn't offered (hallucinated or
                     # disabled for this experiment). Tell her honestly - the
                     # miscall stays in the trace as a lab artifact.
                     output = f"(unknown tool: {name})"
-                trace.append({"tool": name, "output": output})
+                item = {"tool": name, "output": output}
+                if args:
+                    item["args"] = args  # e.g. the URL web_fetch was given
+                trace.append(item)
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.get("id", ""),
@@ -1329,32 +1608,37 @@ def run_daemon() -> None:
     signal.signal(signal.SIGTERM, _handle_stop)
     signal.signal(signal.SIGINT, _handle_stop)
 
-    # When gated, the daemon does no work unless an experiment is active; it just
-    # stays warm and idles. Experiments are started via the web UI / hannah_run.
-    gated = cfg["daemon"].get("require_active_experiment", True)
-
-    def observing() -> bool:
-        return experiment_active() if gated else True
+    def observing(dcfg) -> bool:
+        # When gated, the daemon does no work unless an experiment is active;
+        # it just stays warm and idles. Re-read each cycle so the gate and the
+        # cadence below can be changed live (e.g. from the web UI) without a
+        # restart.
+        return experiment_active() if dcfg.get("require_active_experiment", True) \
+            else True
 
     # Notice and reflect on any downtime since the last run (only while observing).
-    wake = wake_observation(cfg) if observing() else None
+    wake = wake_observation(cfg) if observing(cfg["daemon"]) else None
     if wake is not None:
         _say("detected a gap in existence; writing a waking entry.")
         reflect(wake, cfg, metrics=collect_metrics())
 
-    if gated and not observing():
+    if not observing(cfg["daemon"]):
         _say("no active experiment; idling until one is started.")
 
     prev_sample = load_snapshot()
     last_reflection = 0.0
-    tick = cfg["daemon"]["sense_tick_s"]
-    heartbeat_s = cfg["daemon"]["heartbeat_s"]
-    min_gap = cfg["daemon"]["min_gap_s"]
-    was_observing = observing()
+    was_observing = observing(cfg["daemon"])
 
     while not stop["flag"]:
         now = time.monotonic()
-        active = observing()
+        # Live config each cycle: cadence and the experiment gate can change
+        # from the web UI and take effect on the next tick, no restart needed.
+        cfg = load_config()
+        dcfg = cfg["daemon"]
+        tick = dcfg["sense_tick_s"]
+        heartbeat_s = dcfg["heartbeat_s"]
+        min_gap = dcfg["min_gap_s"]
+        active = observing(dcfg)
         # Announce transitions so the journalctl log makes the idle/active
         # boundary obvious.
         if active != was_observing:
@@ -1385,7 +1669,7 @@ def run_daemon() -> None:
     # Graceful shutdown: mark it, and (only mid-experiment) write a farewell.
     _say("shutting down.")
     write_heartbeat(graceful=True)
-    if not observing():
+    if not observing(load_config()["daemon"]):
         _say("stopped.")
         return
     farewell = (

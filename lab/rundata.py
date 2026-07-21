@@ -26,7 +26,7 @@ from .sanitizer import Sanitizer
 # Tools that exist in the current runtime (kept in sync with hannah.TOOLS, but
 # listed here so parsing old runs doesn't depend on importing the runtime).
 KNOWN_TOOLS = ["list_processes", "memory_info", "disk_usage",
-               "network_stats", "uptime", "who"]
+               "network_stats", "uptime", "who", "web_search", "web_fetch"]
 
 
 @dataclass
